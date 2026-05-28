@@ -1,0 +1,16 @@
+<configuration>
+
+    <gui-settings-file value="gui-settings.cfg"/>
+
+    <input>
+        <net-file value="chengdu.net.xml"/>
+        <route-files value="chengdu.rou.xml"/>
+    </input>
+
+    <time>
+        <begin value="0"/>
+        <end value="3599.75"/>
+    </time>
+
+	
+</configuration>
