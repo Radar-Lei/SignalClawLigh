@@ -1,0 +1,105 @@
+{
+  "candidate_id": "cyc_432452989_r1_c1_5f7b05",
+  "crossing_id": "432452989",
+  "skill_type": "cycle",
+  "parent_ids": [],
+  "code": "def plan(obs: \"NetworkObservation\") -> \"CyclePlan\":\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    if not green_phases:\n        return CyclePlan(cycle_length=40.0, green_times={}, phase_order=[])\n\n    min_green = 10.0\n    max_green = 60.0\n    min_cycle = 40.0\n    max_cycle = 180.0\n    yellow_time = 3.0\n    all_red_time = 2.0\n    \n    num_phases = len(green_phases)\n    total_lost_time = num_phases * (yellow_time + all_red_time)\n    max_total_green = max(0.0, max_cycle - total_lost_time)\n    min_total_green = num_phases * min_green\n    \n    demands = {}\n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            demands[gp] = 1.0\n            continue\n            \n        local_pressure = phase_obs.queue\n        arrival_prediction = phase_obs.waiting_time * 0.3 + phase_obs.predicted_arrival * 1.0\n        \n        # 综合本地排队、到达预测、上下游压力计算该相位需求\n        d = 1.0 * local_pressure + 0.5 * arrival_prediction\n        d += ego.upstream_release_pressure * 1.0\n        d -= ego.downstream_spillback_risk * 1.5\n        \n        demands[gp] = max(d, 0.1)\n\n    total_demand = sum(demands.values())\n    \n    total_queue = sum(ego.phases[gp].queue for gp in green_phases)\n    # 估算目标总绿灯时间：处理当前排队并附加基础缓冲时间\n    G_target = total_queue * 2.0 + num_phases * 5.0\n    G_target = max(min_total_green, min(max_total_green, G_target))\n\n    green_times = {}\n    if total_demand > 0:\n        for gp in green_phases:\n            gt = G_target * (demands[gp] / total_demand)\n            green_times[gp] = max(min_green, min(max_green, gt))\n    else:\n        for gp in green_phases:\n            green_times[gp] = G_target / num_phases\n\n    G_actual = sum(green_times.values())\n\n    # 边界修正：如果因为个别相位达到 max_green 导致总绿灯时间超出允许上限，则按比例压缩\n    if G_actual > max_total_green:\n        excess = G_actual - max_total_green\n        reducible = {}\n        total_reducible = 0.0\n        for gp, gt in green_times.items():\n            if gt > min_green:\n                reducible[gp] = gt - min_green\n                total_reducible += reducible[gp]\n        \n        if total_reducible > 0:\n            for gp, red in reducible.items():\n                green_times[gp] -= excess * (red / total_reducible)\n                green_times[gp] = max(min_green, green_times[gp])\n        \n        G_actual = sum(green_times.values())\n\n    cycle_length = G_actual + total_lost_time\n    cycle_length = max(min_cycle, min(max_cycle, cycle_length))\n\n    plan_obj = CyclePlan(\n        cycle_length=cycle_length,\n        green_times=green_times,\n        phase_order=green_phases,\n    )\n    return plan_obj",
+  "code_hash": "dd0bd8d24bd4fae60746d99c7bf884ea688e13dc194696d12d08b0eea05cdbf8",
+  "prompt": "# 路口特征\n路口 ID: 432452989\n相位数量: 4\n最小绿灯: 10.0s\n最大绿灯: 60.0s\n最小周期: 40.0s\n最大周期: 180.0s\n黄灯时间: 3.0s\n全红时间: 2.0s\n最大延长: 5.0s\n最大缩短: 5.0s\n强制相位: 无\n\n\n# 约束条件\n  min_green: 10.0\n  max_green: 60.0\n  min_cycle: 40.0\n  max_cycle: 180.0\n  yellow_time: 3.0\n  all_red_time: 2.0\n  max_extend: 5.0\n  max_shorten: 5.0\n  force_phase_ids: set()\n\n# 父代算法代码\n```python\n\"\"\"Cycle planner seed for intersection 432452989.\"\"\"\nfrom collections import deque\nfrom typing import Dict, List, Optional\nfrom signalclaw.core.state import NetworkObservation, CyclePlan\n\n_min_green = 10.0\n_max_green = 60.0\n_base_cycle = 80.0\n_history_window = 5\n\n_pressure_history: Dict[int, deque] = {}\n_last_green_time: Dict[int, float] = {}\n\n\ndef _get_history(phase_id: int) -> deque:\n    if phase_id not in _pressure_history:\n        _pressure_history[phase_id] = deque(maxlen=_history_window)\n    return _pressure_history[phase_id]\n\n\ndef plan(obs: \"NetworkObservation\") -> \"CyclePlan\":\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    if not green_phases:\n        return CyclePlan(cycle_length=_base_cycle, green_times={}, phase_order=[])\n\n    scores = {}\n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            scores[gp] = 0.0\n            continue\n        local_pressure = phase_obs.queue\n        downstream_total = sum(ego.downstream_queue.values()) if ego.downstream_queue else 0.0\n        n_downstream = max(len(ego.downstream_queue), 1)\n        avg_downstream = downstream_total / n_downstream\n        spillback_risk = max(0, avg_downstream - 5.0) * 2.0\n        arrival_prediction = phase_obs.waiting_time * 0.3\n        last_served = _last_green_time.get(gp, 0)\n        hunger_time = obs.timestamp - last_served\n        hunger_bonus = min(hunger_time * 0.5, 15.0)\n        score = (\n            1.0 * local_pressure\n            + 0.4 * arrival_prediction\n            - 0.8 * spillback_risk\n            + 0.6 * hunger_bonus\n        )\n        scores[gp] = score\n        _get_history(g",
+  "prompt_hash": "07b4ae8c003ceabda18d958d6f23b9591f3673af5c654399dc24ebdcbdc38691",
+  "glm_model": "glm-5.1",
+  "generation": 1,
+  "static_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [],
+    "has_correct_interface": true,
+    "complexity_score": 14.9
+  },
+  "prior_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [],
+    "score": 1.0
+  },
+  "replay_report": {
+    "candidate_id": "cyc_432452989_r1_c1_5f7b05",
+    "crossing_id": "432452989",
+    "skill_type": "cycle",
+    "passed": true,
+    "violations": [],
+    "score": 0.9437,
+    "failure_cases": [
+      {
+        "scenario": "normal",
+        "violation": "prior_warning",
+        "detail": "[normal][prior] phase 2 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 0 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 1 green_time=13.1s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 2 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 3 green_time=10.9s < 先验下限 15s"
+      },
+      {
+        "scenario": "extreme_imbalance",
+        "violation": "prior_warning",
+        "detail": "[extreme_imbalance][prior] phase 1 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "extreme_imbalance",
+        "violation": "prior_warning",
+        "detail": "[extreme_imbalance][prior] phase 2 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "extreme_imbalance",
+        "violation": "prior_warning",
+        "detail": "[extreme_imbalance][prior] phase 3 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "six_phase",
+        "violation": "prior_warning",
+        "detail": "[six_phase][prior] phase 0 green_time=14.5s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 0 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 1 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 2 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 3 green_time=10.0s < 先验下限 15s"
+      }
+    ],
+    "test_cases_run": 8
+  },
+  "sumo_report": null,
+  "selected": false,
+  "rejection_reason": "",
+  "created_at": "2026-05-29T14:14:55.520332+00:00"
+}

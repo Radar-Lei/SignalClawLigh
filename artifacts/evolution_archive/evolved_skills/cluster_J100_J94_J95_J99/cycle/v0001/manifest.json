@@ -1,0 +1,26 @@
+{
+  "skill_id": "tls_cluster_J100_J94_J95_J99_cycle_v0001",
+  "crossing_id": "cluster_J100_J94_J95_J99",
+  "skill_type": "cycle",
+  "version": 1,
+  "parent_skill_ids": [],
+  "code_hash": "62a10da8dbdc03dae740e7aeccbf9314879320d3ebee6a0a18dec42d8d802627",
+  "prompt_hash": "532b4af1c9eb17882b7e003a05d4da3cf663ca04971b93754e6d32c6dacad489",
+  "data_split_hash": "",
+  "sumo_scenario_hash": "",
+  "glm_model": "glm-5.1",
+  "created_at": "2026-05-29T13:00:27.849026+00:00",
+  "frozen": true,
+  "online_learning": false,
+  "exploration": false,
+  "constraints_profile": "default",
+  "metrics": {
+    "replay_score": 0.9268,
+    "sumo_score": 0.0,
+    "safety_violations": 0,
+    "phase_starvation_count": 0,
+    "mean_waiting": 0.0,
+    "mean_queue": 0.0,
+    "throughput": 0.0
+  }
+}

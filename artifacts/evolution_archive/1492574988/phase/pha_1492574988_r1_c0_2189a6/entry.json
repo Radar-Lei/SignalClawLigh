@@ -1,0 +1,27 @@
+{
+  "candidate_id": "pha_1492574988_r1_c0_2189a6",
+  "crossing_id": "1492574988",
+  "skill_type": "phase",
+  "parent_ids": [],
+  "code": "```json\n{\n  \"rationale\": \"改进版相位微调算法与配对的CyclePlan算法深度协调：1) 使用相同的压力评分公式（排队、等待时间、到达预测、下游溢出惩罚）进行实时决策；2) 在相位后半段（剩余≤10秒且已满足最小绿灯）进行动态微调——高需求+低下游风险时extend，空队列+下一相位紧急或下游溢出风险高时shorten；3) 通过近似已运行时间估算确保不违反最小绿灯和最大绿灯约束。\",\n  \"expected_effect\": \"通过压力感知的动态微调，在高需求时延长有效相位减少排队积累，在低需求或溢出风险时提前释放绿灯给更需要的相位，从而降低平均等待时间和排队长度，同时避免向拥堵下游方向过度放行导致溢出。\",\n  \"risk\": \"1) 近似已运行时间（planned_green - remaining）在有extend/shorten后可能不精确，但作为启发式足够安全；2) 如果CyclePlan计划本身不合理，微调的效果有限；3) shorten可能增加黄灯切换频率，但通过最小绿灯约束已限制。\",\n  \"code\": \"import math\\n\\n_decision_interval = 5.0\\n_max_extend = 5.0\\n_max_shorten",
+  "code_hash": "0a6d9e82f3f517ec7f41bfdbc213a7128f29d8a47509ff2e155dd1b36347d5a2",
+  "prompt": "# 路口特征\n路口 ID: 1492574988\n相位数量: 4\n最小绿灯: 10.0s\n最大绿灯: 60.0s\n最小周期: 40.0s\n最大周期: 180.0s\n黄灯时间: 3.0s\n全红时间: 2.0s\n最大延长: 5.0s\n最大缩短: 5.0s\n强制相位: 无\n\n\n# 约束条件\n  min_green: 10.0\n  max_green: 60.0\n  min_cycle: 40.0\n  max_cycle: 180.0\n  yellow_time: 3.0\n  all_red_time: 2.0\n  max_extend: 5.0\n  max_shorten: 5.0\n  force_phase_ids: set()\n\n# 配对的 CyclePlan 算法代码（只读参考）\n```python\nimport math\n\ndef plan(obs):\n    \"\"\"改进的交通信号控制算法 - 多维度压力感知和溢出预防\"\"\"\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    num_phases = len(green_phases)\n    \n    # 约束参数\n    MIN_GREEN = 10.0\n    MAX_GREEN = 60.0\n    MIN_CYCLE = 40.0\n    MAX_CYCLE = 180.0\n    YELLOW_TIME = 3.0\n    ALL_RED_TIME = 2.0\n    \n    if num_phases == 0:\n        return CyclePlan(cycle_length=80.0, green_times={}, phase_order=[])\n    \n    # 每个周期的损失时间（黄灯+全红）\n    total_lost_time = num_phases * (YELLOW_TIME + ALL_RED_TIME)\n    \n    # === 计算各相位的压力评分 ===\n    scores = {}\n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            scores[gp] = 0.1\n            continue\n        \n        # 排队压力 - 直接反映当前需求\n        queue_score = phase_obs.queue * 1.5\n        \n        # 等待时间压力 - 使用对数平滑，避免极端值主导\n        wait_score = math.log1p(phase_obs.waiting_time) * 2.5\n        \n        # 到达预测 - 反映未来需求\n        arrival_score = phase_obs.predicted_arrival * 0.5\n        \n        # 上游释放压力\n        upstream_score = ego.upstream_release_pressure * 0.4\n        \n        # 下游溢出风险 - 分级惩罚\n        spillback_risk = ego.downstream_spillback_risk\n        spillback_penalty = spillback_risk * (5.0 if spillback_risk > 0.5 else 2.0)\n        \n        # 饱和流率因子 - 高流率需要更多绿灯时间\n        sat_factor = max(0.5, min(1.5, phase_obs.saturation_flow / 1800.0))\n        \n        # 综合评分\n        raw_score = queue_score + wait_score + arrival_score + upstream_score - spillback_penalty\n        scores[gp] = max(raw_score * sat_factor, 0.1)\n    \n    # === 计算周期长度 ===\n    total_queue = sum(p.queue for p in ego.phases.values())\n    total_arrival = sum(p.predicte",
+  "prompt_hash": "af41386baedc09f80a627236a2db61cee78e2478e97cc4438c9c06550128e9f7",
+  "glm_model": "glm-5.1",
+  "generation": 1,
+  "static_check": {
+    "passed": false,
+    "violations": [
+      "语法错误: unterminated string literal (detected at line 6) (<unknown>, line 6)"
+    ],
+    "warnings": [],
+    "has_correct_interface": false,
+    "complexity_score": 0.0
+  },
+  "prior_check": null,
+  "replay_report": null,
+  "sumo_report": null,
+  "selected": false,
+  "rejection_reason": "AST 检查失败: 语法错误: unterminated string literal (detected at line 6) (<unknown>, line 6)",
+  "created_at": "2026-05-29T10:24:42.559191+00:00"
+}

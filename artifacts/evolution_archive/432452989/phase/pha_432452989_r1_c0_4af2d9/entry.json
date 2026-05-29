@@ -1,0 +1,27 @@
+{
+  "candidate_id": "pha_432452989_r1_c0_4af2d9",
+  "crossing_id": "432452989",
+  "skill_type": "phase",
+  "parent_ids": [],
+  "code": "",
+  "code_hash": "",
+  "prompt": "# 路口特征\n路口 ID: 432452989\n相位数量: 4\n最小绿灯: 10.0s\n最大绿灯: 60.0s\n最小周期: 40.0s\n最大周期: 180.0s\n黄灯时间: 3.0s\n全红时间: 2.0s\n最大延长: 5.0s\n最大缩短: 5.0s\n强制相位: 无\n\n\n# 约束条件\n  min_green: 10.0\n  max_green: 60.0\n  min_cycle: 40.0\n  max_cycle: 180.0\n  yellow_time: 3.0\n  all_red_time: 2.0\n  max_extend: 5.0\n  max_shorten: 5.0\n  force_phase_ids: set()\n\n# 配对的 CyclePlan 算法代码（只读参考）\n```python\ndef plan(obs: \"NetworkObservation\") -> \"CyclePlan\":\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    if not green_phases:\n        return CyclePlan(cycle_length=40.0, green_times={}, phase_order=[])\n\n    min_green = 10.0\n    max_green = 60.0\n    min_cycle = 40.0\n    max_cycle = 180.0\n    yellow_time = 3.0\n    all_red_time = 2.0\n    \n    num_phases = len(green_phases)\n    total_lost_time = num_phases * (yellow_time + all_red_time)\n    max_total_green = max(0.0, max_cycle - total_lost_time)\n    min_total_green = num_phases * min_green\n    \n    demands = {}\n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            demands[gp] = 1.0\n            continue\n            \n        local_pressure = phase_obs.queue\n        arrival_prediction = phase_obs.waiting_time * 0.3 + phase_obs.predicted_arrival * 1.0\n        \n        # 综合本地排队、到达预测、上下游压力计算该相位需求\n        d = 1.0 * local_pressure + 0.5 * arrival_prediction\n        d += ego.upstream_release_pressure * 1.0\n        d -= ego.downstream_spillback_risk * 1.5\n        \n        demands[gp] = max(d, 0.1)\n\n    total_demand = sum(demands.values())\n    \n    total_queue = sum(ego.phases[gp].queue for gp in green_phases)\n    # 估算目标总绿灯时间：处理当前排队并附加基础缓冲时间\n    G_target = total_queue * 2.0 + num_phases * 5.0\n    G_target = max(min_total_green, min(max_total_green, G_target))\n\n    green_times = {}\n    if total_demand > 0:\n        for gp in green_phases:\n            gt = G_target * (demands[gp] / total_demand)\n            green_times[gp] = max(min_green, min(max_green, gt))\n    else:\n        for gp in green_phases:\n            green_",
+  "prompt_hash": "f3e7104662bee6bb37e703daf800cf60c9e930f5c1e98d11233c9c8b2385a6b2",
+  "glm_model": "glm-5.1",
+  "generation": 1,
+  "static_check": {
+    "passed": false,
+    "violations": [
+      "phase skill 必须定义 decide() 函数"
+    ],
+    "warnings": [],
+    "has_correct_interface": false,
+    "complexity_score": 1.0
+  },
+  "prior_check": null,
+  "replay_report": null,
+  "sumo_report": null,
+  "selected": false,
+  "rejection_reason": "AST 检查失败: phase skill 必须定义 decide() 函数",
+  "created_at": "2026-05-29T14:42:02.510984+00:00"
+}

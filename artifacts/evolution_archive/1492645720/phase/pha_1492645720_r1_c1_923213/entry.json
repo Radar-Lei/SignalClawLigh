@@ -1,0 +1,53 @@
+{
+  "candidate_id": "pha_1492645720_r1_c1_923213",
+  "crossing_id": "1492645720",
+  "skill_type": "phase",
+  "parent_ids": [],
+  "code": "import math\n\n# ===== 配置参数 =====\n_decision_interval = 5.0\n_min_green = 10.0\n_max_green = 60.0\n_max_extend = 5.0\n_max_shorten = 5.0\n\n# 阈值配置\n_extend_demand_threshold = 3.0\n_low_demand_threshold = 1.5\n_next_urgent_threshold = 5.0\n_downstream_risk_limit = 15.0\n_downstream_spillback_limit = 0.5\n_high_downstream_queue = 20.0\n\n# ===== 状态 =====\n_phase_index: int = 0\n_phase_remaining: float = 0.0\n_phase_elapsed: float = 0.0\n_current_plan_hash: int = 0\n_planned_duration: float = 15.0\n\n\ndef _plan_hash(plan):\n    return hash((plan.cycle_length, tuple(sorted(plan.green_times.items())), tuple(plan.phase_order)))\n\n\ndef _phase_demand(phase_obs):\n    \"\"\"计算相位需求分数，与CyclePlan的评分逻辑对齐\"\"\"\n    if phase_obs is None:\n        return 0.0\n    return phase_obs.queue * 1.0 + phase_obs.predicted_arrival * 0.8 + phase_obs.waiting_time * 0.3\n\n\ndef decide(obs, plan):\n    global _phase_index, _phase_remaining, _phase_elapsed, _current_plan_hash, _planned_duration\n\n    ego = obs.ego\n    phase_order = plan.phase_order\n\n    if not phase_order:\n        return PhaseCommand(\n            action=\"hold\", next_phase_id=ego.current_phase_id,\n            duration=_decision_interval, reason_code=\"no_phases\",\n        )\n\n    # 检测新计划\n    ph = _plan_hash(plan)\n    if _current_plan_hash != ph:\n        _phase_index = 0\n        _current_plan_hash = ph\n        _phase_elapsed = 0.0\n        first_phase = phase_order[0]\n        _planned_duration = plan.green_times.get(first_phase, 15.0)\n        _planned_duration = max(_min_green, min(_max_green, _planned_duration))\n        _phase_remaining = _planned_duration\n        return PhaseCommand(\n            action=\"switch\", next_phase_id=first_phase,\n            duration=_planned_duration, reason_code=\"new_plan\",\n        )\n\n    remaining = _phase_remaining\n    current_phase = phase_order[_phase_index]\n    next_idx = (_phase_index + 1) % len(phase_order)\n    next_phase = phase_order[next_idx]\n\n    # 相位自然结束\n    if remaining <= 0:\n        _phase_index = next_idx\n        _phase_elapsed = 0.0\n        _planned_duration = plan.green_times.get(next_phase, 15.0)\n        _planned_duration = max(_min_green, min(_max_green, _planned_duration))\n        _phase_remaining = _planned_duration\n        return PhaseCommand(\n            action=\"switch\", next_phase_id=next_phase,\n            duration=_planned_duration, reason_code=\"phase_end\",\n        )\n\n    # 获取观测\n    phase_obs = ego.phases.get(current_phase)\n    next_obs = ego.phases.get(next_phase)\n    downstream_risk = sum(ego.downstream_queue.values()) if ego.downstream_queue else 0.0\n    spillback = ego.downstream_spillback_risk\n\n    cur_demand = _phase_demand(phase_obs)\n    nxt_demand = _phase_demand(next_obs)\n    elapsed = _phase_elapsed\n\n    # ===== 1. 最小绿灯保护：未达到最小绿灯时间不做任何调整 =====\n    if elapsed < _min_green:\n        _phase_remaining -= _decision_interval\n        _phase_elapsed += _decision_interval\n        return PhaseCommand(\n            action=\"hold\", next_phase_id=current_phase,\n            duration=_decision_interval, reason_code=\"min_green\",\n        )\n\n    # ===== 2. 下游溢出保护 - 主动缩短 =====\n    if spillback > _downstream_spillback_limit or downstream_risk > _high_downstream_queue:\n        if remaining > _decision_interval:\n            shorten_amt = min(_max_shorten, remaining - _decision_interval)\n            shorten_amt = max(0.0, shorten_amt)\n            if shorten_amt > 0:\n                new_remaining = remaining - shorten_amt\n                _phase_remaining = new_remaining - _decision_interval\n                _phase_elapsed += _decision_interval\n                return PhaseCommand(\n                    action=\"shorten\", next_phase_id=current_phase,\n                    duration=new_remaining,\n                    reason_code=\"shorten_spillback_r\" + str(int(downstream_risk)),\n                )\n\n    # ===== 3. 提前切换 - 当前需求极低且下一相位紧急 =====\n    if phase_obs is not None:\n        cur_queue = phase_obs.queue\n        if (cur_queue < 1.0\n            and cur_demand < _low_demand_threshold\n            and nxt_demand > _next_urgent_threshold\n            and remaining > _decision_interval):\n            _phase_index = next_idx\n            _phase_elapsed = 0.0\n            _planned_duration = plan.green_times.get(next_phase, 15.0)\n            _planned_duration = max(_min_green, min(_max_green, _planned_duration))\n            _phase_remaining = _planned_duration\n            return PhaseCommand(\n                action=\"switch\", next_phase_id=next_phase,\n                duration=_planned_duration,\n                reason_code=\"early_switch_nd\" + str(int(nxt_demand)),\n            )\n\n    # ===== 4. 延长 - 当前仍有需求且下游畅通 =====\n    if phase_obs is not None and remaining <= _decision_interval:\n        if cur_demand > _extend_demand_threshold and downstream_risk < _downstream_risk_limit:\n            max_extra = _max_green - elapsed - remaining\n            extend_amt = min(_max_extend, max(1.0, cur_demand * 0.3))\n            extend_amt = min(extend_amt, max_extra)\n            if extend_amt > 0:\n                _phase_remaining = remaining + extend_amt - _decision_interval\n                _phase_elapsed += _decision_interval\n                return PhaseCommand(\n                    action=\"extend\", next_phase_id=current_phase,\n                    duration=remaining + extend_amt,\n                    reason_code=\"extend_d\" + str(int(cur_demand)),\n                )\n\n    # ===== 5. 正常推进 =====\n    _phase_remaining -= _decision_interval\n    _phase_elapsed += _decision_interval\n    return PhaseCommand(\n        action=\"hold\", next_phase_id=current_phase,\n        duration=_decision_interval, reason_code=\"continuing\",\n    )\n\n\ndef _reset():\n    global _phase_index, _phase_remaining, _phase_elapsed, _current_plan_hash, _planned_duration\n    _phase_index = 0\n    _phase_remaining = 0.0\n    _phase_elapsed = 0.0\n    _current_plan_hash = 0\n    _planned_duration = 15.0\n",
+  "code_hash": "e2e9bf072a1e38593148c6514c355847b47c0a067c8032e7fc6b243b26ed054f",
+  "prompt": "# 路口特征\n路口 ID: 1492645720\n相位数量: 4\n最小绿灯: 10.0s\n最大绿灯: 60.0s\n最小周期: 40.0s\n最大周期: 180.0s\n黄灯时间: 3.0s\n全红时间: 2.0s\n最大延长: 5.0s\n最大缩短: 5.0s\n强制相位: 无\n\n\n# 约束条件\n  min_green: 10.0\n  max_green: 60.0\n  min_cycle: 40.0\n  max_cycle: 180.0\n  yellow_time: 3.0\n  all_red_time: 2.0\n  max_extend: 5.0\n  max_shorten: 5.0\n  force_phase_ids: set()\n\n# 配对的 CyclePlan 算法代码（只读参考）\n```python\nfrom typing import Dict\nfrom signalclaw.core.state import NetworkObservation, CyclePlan\n\ndef plan(obs: \"NetworkObservation\") -> \"CyclePlan\":\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    \n    if not green_phases:\n        return CyclePlan(cycle_length=40.0, green_times={}, phase_order=[])\n        \n    scores = {}\n    total_demand = 0.0\n    \n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            scores[gp] = 0.1\n            continue\n            \n        demand = phase_obs.queue * 1.0 + phase_obs.predicted_arrival * 0.8\n        wait_score = phase_obs.waiting_time * 0.3\n        \n        score = demand + wait_score\n        scores[gp] = max(score, 0.1)\n        total_demand += demand\n        \n    # Base cycle calculation bounded by constraints\n    cycle = 40.0 + (total_demand / 100.0) * 140.0\n    \n    # Incorporate upstream and downstream coordination dynamically\n    cycle += ego.upstream_release_pressure * 10.0\n    cycle -= ego.downstream_spillback_risk * 10.0\n    cycle = max(40.0, min(180.0, cycle))\n    \n    # Iterative allocation to enforce min_green (10.0) and max_green (60.0) constraints\n    green_times = {}\n    remaining_phases = list(green_phases)\n    remaining_cycle = cycle\n    \n    for _ in range(len(green_phases)):\n        if not remaining_phases:\n            break\n            \n        active_scores = {gp: scores.get(gp, 0.1) for gp in remaining_phases}\n        total_score = sum(active_scores.values())\n        \n        temp_times = {}\n        if total_score > 0:\n            for gp in remaining_phases:\n                ratio = active_scores[gp",
+  "prompt_hash": "871f88caf46e83c72e28f822b6bc7014413d4df392d36e88434b963225b21362",
+  "glm_model": "glm-5.1",
+  "generation": 1,
+  "static_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [
+      "模块级状态变量: _decision_interval（可能导致不确定性）",
+      "模块级状态变量: _min_green（可能导致不确定性）",
+      "模块级状态变量: _max_green（可能导致不确定性）",
+      "模块级状态变量: _max_extend（可能导致不确定性）",
+      "模块级状态变量: _max_shorten（可能导致不确定性）",
+      "模块级状态变量: _extend_demand_threshold（可能导致不确定性）",
+      "模块级状态变量: _low_demand_threshold（可能导致不确定性）",
+      "模块级状态变量: _next_urgent_threshold（可能导致不确定性）",
+      "模块级状态变量: _downstream_risk_limit（可能导致不确定性）",
+      "模块级状态变量: _downstream_spillback_limit（可能导致不确定性）",
+      "模块级状态变量: _high_downstream_queue（可能导致不确定性）"
+    ],
+    "has_correct_interface": true,
+    "complexity_score": 21.9
+  },
+  "prior_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [
+      "代码中存在可能产生过大延长幅度的数值: 60.0s (先验上限: 8s)"
+    ],
+    "score": 0.9
+  },
+  "replay_report": {
+    "candidate_id": "pha_1492645720_r1_c1_923213",
+    "crossing_id": "1492645720",
+    "skill_type": "phase",
+    "passed": true,
+    "violations": [],
+    "score": 1.0,
+    "failure_cases": [],
+    "test_cases_run": 8
+  },
+  "sumo_report": null,
+  "selected": false,
+  "rejection_reason": "",
+  "created_at": "2026-05-29T13:16:35.776863+00:00"
+}

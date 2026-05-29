@@ -1,0 +1,51 @@
+{
+  "candidate_id": "pha_cluster_J100_J94_J95_J99_r1_c0_b1ad50",
+  "crossing_id": "cluster_J100_J94_J95_J99",
+  "skill_type": "phase",
+  "parent_ids": [],
+  "code": "\"\"\"Improved Phase micro adjuster for intersection cluster_J100_J94_J95_J99.\"\"\"\n\n_decision_interval = 5.0\n_max_extend = 5.0\n_max_shorten = 5.0\n_min_green = 10.0\n_max_green = 60.0\n\n_phase_index = 0\n_phase_remaining = 0.0\n_current_plan_hash = 0\n_elapsed = 0.0\n\n\ndef _plan_hash(plan):\n    return hash((plan.cycle_length, tuple(sorted(plan.green_times.items())), tuple(plan.phase_order)))\n\n\ndef _phase_pressure(ego, phase_id):\n    \"\"\"Pressure score aligned with CyclePlan scoring for consistency.\"\"\"\n    po = ego.phases.get(phase_id)\n    if po is None:\n        return 0.1\n    local = po.queue * 1.2 + po.predicted_arrival * 0.8\n    hunger = po.waiting_time * 0.5\n    ds_total = sum(ego.downstream_queue.values()) if ego.downstream_queue else 0.0\n    n_ds = max(len(ego.downstream_queue), 1)\n    avg_ds = ds_total / n_ds\n    spill = max(0.0, avg_ds - 5.0) * 2.0 + ego.downstream_spillback_risk * 2.5\n    up = ego.upstream_release_pressure * 1.0\n    return max(local + hunger - spill + up, 0.1)\n\n\ndef _ds_risk(ego):\n    ds_total = sum(ego.downstream_queue.values()) if ego.downstream_queue else 0.0\n    n_ds = max(len(ego.downstream_queue), 1)\n    avg_ds = ds_total / n_ds\n    return max(0.0, avg_ds - 5.0) * 2.0 + ego.downstream_spillback_risk * 2.5\n\n\ndef decide(obs, plan):\n    global _phase_index, _phase_remaining, _current_plan_hash, _elapsed\n\n    ego = obs.ego\n    phase_order = plan.phase_order\n\n    if not phase_order:\n        return PhaseCommand(\n            action=\"hold\", next_phase_id=ego.current_phase_id,\n            duration=_decision_interval, reason_code=\"no_phases\",\n        )\n\n    ph = _plan_hash(plan)\n    if _current_plan_hash != ph:\n        _phase_index = 0\n        _current_plan_hash = ph\n        _elapsed = 0.0\n        fp = phase_order[0]\n        gt = plan.green_times.get(fp, 15.0)\n        _phase_remaining = gt\n        return PhaseCommand(\n            action=\"switch\", next_phase_id=fp,\n            duration=gt, reason_code=\"new_plan\",\n        )\n\n    remaining = _phase_remaining\n\n    if remaining <= 0:\n        ni = (_phase_index + 1) % len(phase_order)\n        nxt_ph = phase_order[ni]\n        _phase_index = ni\n        _elapsed = 0.0\n        gt = plan.green_times.get(nxt_ph, 15.0)\n        _phase_remaining = gt\n        return PhaseCommand(\n            action=\"switch\", next_phase_id=nxt_ph,\n            duration=gt, reason_code=\"phase_end\",\n        )\n\n    cur_id = phase_order[_phase_index]\n    ni = (_phase_index + 1) % len(phase_order)\n    nxt_id = phase_order[ni]\n\n    cur_p = _phase_pressure(ego, cur_id)\n    nxt_p = _phase_pressure(ego, nxt_id)\n    dsr = _ds_risk(ego)\n\n    po = ego.phases.get(cur_id)\n    cur_q = po.queue if po is not None else 0.0\n\n    el = _elapsed\n\n    # Micro-adjustment only after min_green substantially met\n    if el >= _min_green - _decision_interval:\n\n        # EXTEND: high demand + low spillback + current >> next + near end of green\n        if cur_p > 4.0 and dsr < 10.0 and cur_p > nxt_p * 1.3 and remaining <= 15.0:\n            max_ext = max(0.0, _max_green - el - remaining)\n            ext = min(_max_extend, max(1.0, cur_p * 0.25), max_ext)\n            if ext >= 1.0:\n                nr = remaining + ext - _decision_interval\n                if nr > 0:\n                    _phase_remaining = nr\n                    _elapsed += _decision_interval\n                    return PhaseCommand(\n                        action=\"extend\", next_phase_id=cur_id,\n                        duration=nr + _decision_interval,\n                        reason_code=\"extend_p%.0f\" % cur_p,\n                    )\n\n        # EARLY SWITCH: current empty + next hungry\n        if cur_q < 1.0 and cur_p < 2.0 and nxt_p > 3.0 and remaining > 3.0:\n            _phase_index = ni\n            _elapsed = 0.0\n            gt = plan.green_times.get(nxt_id, 15.0)\n            _phase_remaining = gt\n            return PhaseCommand(\n                action=\"switch\", next_phase_id=nxt_id,\n                duration=gt,\n                reason_code=\"early_switch_q%.0f\" % cur_q,\n            )\n\n        # SHORTEN: downstream congested + next phase more urgent\n        if dsr > 12.0 and cur_p < nxt_p and remaining > 5.0:\n            sh = min(_max_shorten, remaining - 3.0)\n            if sh > 0:\n                nr = remaining - sh - _decision_interval\n                if nr > 0:\n                    _phase_remaining = nr\n                    _elapsed += _decision_interval\n                    return PhaseCommand(\n                        action=\"shorten\", next_phase_id=cur_id,\n                        duration=nr + _decision_interval,\n                        reason_code=\"shorten_spill_r%.0f\" % dsr,\n                    )\n\n    # Default: hold with plan\n    _phase_remaining -= _decision_interval\n    _elapsed += _decision_interval\n    return PhaseCommand(\n        action=\"hold\", next_phase_id=cur_id,\n        duration=_decision_interval, reason_code=\"continuing\",\n    )\n\n\ndef _reset():\n    global _phase_index, _phase_remaining, _current_plan_hash, _elapsed\n    _phase_index = 0\n    _phase_remaining = 0.0\n    _current_plan_hash = 0\n    _elapsed = 0.0",
+  "code_hash": "ce31290acc67b4be1933cd29a3469318288d007b39d95ac0d4c71ac3e1d2132e",
+  "prompt": "# 路口特征\n路口 ID: cluster_J100_J94_J95_J99\n相位数量: 4\n最小绿灯: 10.0s\n最大绿灯: 60.0s\n最小周期: 40.0s\n最大周期: 180.0s\n黄灯时间: 3.0s\n全红时间: 2.0s\n最大延长: 5.0s\n最大缩短: 5.0s\n强制相位: 无\n\n\n# 约束条件\n  min_green: 10.0\n  max_green: 60.0\n  min_cycle: 40.0\n  max_cycle: 180.0\n  yellow_time: 3.0\n  all_red_time: 2.0\n  max_extend: 5.0\n  max_shorten: 5.0\n  force_phase_ids: set()\n\n# 配对的 CyclePlan 算法代码（只读参考）\n```python\ndef plan(obs):\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    num_phases = len(green_phases)\n    \n    if num_phases == 0:\n        return CyclePlan(cycle_length=80.0, green_times={}, phase_order=[])\n\n    yellow_time = 3.0\n    all_red_time = 2.0\n    lost_time_per_phase = yellow_time + all_red_time\n    total_lost_time = num_phases * lost_time_per_phase\n    \n    min_green = 10.0\n    max_green = 60.0\n    max_cycle = 180.0\n    \n    scores = {}\n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            scores[gp] = 0.1\n            continue\n            \n        local_pressure = phase_obs.queue * 1.2 + phase_obs.predicted_arrival * 0.8\n        hunger_bonus = phase_obs.waiting_time * 0.5\n        \n        downstream_total = sum(ego.downstream_queue.values()) if ego.downstream_queue else 0.0\n        n_downstream = max(len(ego.downstream_queue), 1)\n        avg_downstream = downstream_total / n_downstream\n        spillback_risk = max(0, avg_downstream - 5.0) * 2.0 + ego.downstream_spillback_risk * 2.5\n        upstream_pressure = ego.upstream_release_pressure * 1.0\n        \n        score = local_pressure + hunger_bonus - spillback_risk + upstream_pressure\n        scores[gp] = max(score, 0.1)\n        \n    total_score = sum(scores.values())\n    \n    total_queue = sum(p.queue for p in ego.phases.values())\n    total_waiting = sum(p.waiting_time for p in ego.phases.values())\n    congestion_index = total_queue * 1.0 + total_waiting * 0.1\n    \n    min_feasible_cycle = num_phases * min_green + total_lost_time\n    \n    if congestion_index < 10.0:\n        targ",
+  "prompt_hash": "e35d40195a7040c22943fa163308e340f92c4c75f61ac3dcaa41916b5198af8e",
+  "glm_model": "glm-5.1",
+  "generation": 1,
+  "static_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [
+      "模块级状态变量: _decision_interval（可能导致不确定性）",
+      "模块级状态变量: _max_extend（可能导致不确定性）",
+      "模块级状态变量: _max_shorten（可能导致不确定性）",
+      "模块级状态变量: _min_green（可能导致不确定性）",
+      "模块级状态变量: _max_green（可能导致不确定性）",
+      "模块级状态变量: _phase_index（可能导致不确定性）",
+      "模块级状态变量: _phase_remaining（可能导致不确定性）",
+      "模块级状态变量: _current_plan_hash（可能导致不确定性）",
+      "模块级状态变量: _elapsed（可能导致不确定性）"
+    ],
+    "has_correct_interface": true,
+    "complexity_score": 22.9
+  },
+  "prior_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [
+      "代码中存在可能产生过大延长幅度的数值: 60.0s (先验上限: 8s)"
+    ],
+    "score": 0.9
+  },
+  "replay_report": {
+    "candidate_id": "pha_cluster_J100_J94_J95_J99_r1_c0_b1ad50",
+    "crossing_id": "cluster_J100_J94_J95_J99",
+    "skill_type": "phase",
+    "passed": true,
+    "violations": [],
+    "score": 1.0,
+    "failure_cases": [],
+    "test_cases_run": 8
+  },
+  "sumo_report": null,
+  "selected": false,
+  "rejection_reason": "",
+  "created_at": "2026-05-29T12:34:44.948920+00:00"
+}

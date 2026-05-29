@@ -1,0 +1,105 @@
+SUMO config: /home/samuel/projects/signalclaw/sumo_scenarios/chengdu/chengdu.sumocfg
+Simulation time: 3600s
+
+============================================================
+Running method: FixedTime
+============================================================
+ Retrying in 1 seconds
+  [FixedTime] Found 46 traffic lights
+  [FixedTime] Step 600, time=600s, queue=506
+  [FixedTime] Step 1200, time=1200s, queue=647
+  [FixedTime] Step 1800, time=1800s, queue=1133
+  [FixedTime] Step 2400, time=2400s, queue=1169
+  [FixedTime] Step 3000, time=3000s, queue=1166
+  [FixedTime] Step 3600, time=3600s, queue=1367
+  [FixedTime] Completed: 7767 vehicles, avg_travel=372.8s, avg_queue=776.1, avg_wait=99.5s
+
+============================================================
+Running method: MaxPressure
+============================================================
+ Retrying in 1 seconds
+  [MaxPressure] Found 46 traffic lights
+  [MaxPressure] Step 600, time=600s, queue=352
+  [MaxPressure] Step 1200, time=1200s, queue=468
+  [MaxPressure] Step 1800, time=1800s, queue=790
+  [MaxPressure] Step 2400, time=2400s, queue=997
+  [MaxPressure] Step 3000, time=3000s, queue=852
+  [MaxPressure] Step 3600, time=3600s, queue=1085
+  [MaxPressure] Completed: 7859 vehicles, avg_travel=359.5s, avg_queue=705.3, avg_wait=108.9s
+
+============================================================
+Running method: SignalClaw
+============================================================
+ Retrying in 1 seconds
+  [SignalClaw] Found 46 traffic lights
+  [SignalClaw] Step 600, time=600s, queue=310
+  [SignalClaw] Step 1200, time=1200s, queue=453
+  [SignalClaw] Step 1800, time=1800s, queue=685
+  [SignalClaw] Step 2400, time=2400s, queue=762
+  [SignalClaw] Step 3000, time=3000s, queue=658
+  [SignalClaw] Step 3600, time=3600s, queue=710
+  [SignalClaw] Completed: 8013 vehicles, avg_travel=334.4s, avg_queue=531.6, avg_wait=49.0s
+ Retrying in 1 seconds
+
+============================================================
+Running method: SignalClaw-Seed
+  Cohort: seed_v0
+  Crossings: 46
+============================================================
+ Retrying in 1 seconds
+  [SignalClaw-Seed] Found 46 traffic lights
+  [SignalClaw-Seed] Step 600, time=600s, queue=339
+  [SignalClaw-Seed] Step 1200, time=1200s, queue=508
+  [SignalClaw-Seed] Step 1800, time=1800s, queue=817
+  [SignalClaw-Seed] Step 2400, time=2400s, queue=914
+  [SignalClaw-Seed] Step 3000, time=3000s, queue=1132
+  [SignalClaw-Seed] Step 3600, time=3600s, queue=1448
+  [SignalClaw-Seed] Completed: 7508 vehicles, avg_travel=361.8s, avg_queue=747.6, avg_wait=126.9s
+ Retrying in 1 seconds
+
+============================================================
+Running method: SignalClaw-Evolved
+  Cohort: evolved_seed_v0
+  Crossings: 10
+============================================================
+ Retrying in 1 seconds
+  [SignalClaw-Evolved] Found 46 traffic lights
+  [SignalClaw-Evolved] Failed: 'Crossing 1492574990 not in cohort evolved_seed_v0'
+
+==========================================================================================
+                                    EXPERIMENT RESULTS                                    
+==========================================================================================
+Metric                               FixedTime     MaxPressure      SignalClaw SignalClaw-Seed
+------------------------------------------------------------------------------------------
+Avg Travel Time (s)                  372.8         359.5         334.4 *       361.8  
+Completed Vehicles                    7767          7859          8013 *        7508  
+Avg Queue Length                     776.1         705.3         531.6 *       747.6  
+Max Queue Length                    1421.0        1162.0         894.0 *      1573.0  
+Avg Waiting Time (s)                  99.5         108.9          49.0 *       126.9  
+Max Waiting Time (s)                 512.6         567.4         234.1 *       822.1  
+Total Stops                          83650         76004         57258 *       80578  
+------------------------------------------------------------------------------------------
+* = best value
+
+                                 SignalClaw vs FixedTime                                  
+------------------------------------------------------------------------------------------
+  Avg Travel Time (s)           : -10.3% (BETTER)
+  Completed Vehicles            : +3.2% (BETTER)
+  Avg Queue Length              : -31.5% (BETTER)
+  Max Queue Length              : -37.1% (BETTER)
+  Avg Waiting Time (s)          : -50.8% (BETTER)
+  Max Waiting Time (s)          : -54.3% (BETTER)
+  Total Stops                   : -31.6% (BETTER)
+
+                               SignalClaw-Seed vs FixedTime                               
+------------------------------------------------------------------------------------------
+  Avg Travel Time (s)           : -3.0% (BETTER)
+  Completed Vehicles            : -3.3% (worse)
+  Avg Queue Length              : -3.7% (BETTER)
+  Max Queue Length              : +10.7% (worse)
+  Avg Waiting Time (s)          : +27.5% (worse)
+  Max Waiting Time (s)          : +60.4% (worse)
+  Total Stops                   : -3.7% (BETTER)
+Results saved to /home/samuel/projects/signalclaw/results/
+Error: tcpip::Socket::recvAndCheck @ recv: peer shutdown
+Quitting (on error).

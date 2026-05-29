@@ -1,0 +1,26 @@
+{
+  "skill_id": "tls_J54_cycle_v0000",
+  "crossing_id": "J54",
+  "skill_type": "cycle",
+  "version": 0,
+  "parent_skill_ids": [],
+  "code_hash": "c5bda8df4bc99fd6963e8a6e0678719b92909a3ad45fba185a77eb2d406f3f93",
+  "prompt_hash": "2e3777029bff9b875eb22d701e980ef0d3dbd6d8fc9313f20e64d766b9d2ac64",
+  "data_split_hash": "",
+  "sumo_scenario_hash": "e456d119f812a3ce3112bcca2128f0e779155d3c2db44857fd91a8ec56dee268",
+  "glm_model": "seed",
+  "created_at": "2026-05-29T02:19:50.378829+00:00",
+  "frozen": true,
+  "online_learning": false,
+  "exploration": false,
+  "constraints_profile": "default",
+  "metrics": {
+    "replay_score": 0.0,
+    "sumo_score": 0.0,
+    "safety_violations": 0,
+    "phase_starvation_count": 0,
+    "mean_waiting": 0.0,
+    "mean_queue": 0.0,
+    "throughput": 0.0
+  }
+}

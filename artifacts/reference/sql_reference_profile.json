@@ -1,0 +1,233 @@
+{
+  "metadata": {
+    "source": "traffic_full_20260521_112701.sql",
+    "data_period": "2025-11 ~ 2026-05",
+    "crossing_count": 3,
+    "total_flow_records": 101976509,
+    "total_prediction_records": 270367,
+    "total_adjustment_records": 105329,
+    "total_analyze_records": 19655,
+    "intersection_details": [
+      {
+        "id": 1,
+        "name": "剑南大道与府城大道交叉口",
+        "real_id": "81231",
+        "ai_enabled": true,
+        "phase_count": 5,
+        "phase_ids": [
+          1,
+          2,
+          3,
+          4,
+          9
+        ],
+        "lane_count_range": [
+          15,
+          48
+        ],
+        "micro_adjust_mode": "AI微调",
+        "signal_dispatch_mode": "相位计划+相位下发",
+        "control_period": "07:35-19:20 (Mon-Fri)",
+        "base_cycle": {
+          "1": 60,
+          "2": 25,
+          "3": 50,
+          "4": 25
+        }
+      },
+      {
+        "id": 2,
+        "name": "盛邦街",
+        "real_id": "94122",
+        "ai_enabled": false,
+        "phase_count": 2,
+        "phase_ids": [
+          5,
+          6
+        ],
+        "lane_count_range": [
+          41,
+          135
+        ],
+        "micro_adjust_mode": "关闭",
+        "control_period": "17:00-18:00 (Mon-Fri)"
+      },
+      {
+        "id": 10,
+        "name": "新泽三路-锦和西二街",
+        "real_id": "51010000100134",
+        "ai_enabled": true,
+        "phase_count": 3,
+        "phase_ids": [
+          3,
+          4,
+          9
+        ],
+        "lane_count_range": [
+          15,
+          25
+        ],
+        "micro_adjust_mode": "AI微调",
+        "signal_dispatch_mode": "相位计划+相位下发",
+        "control_period": "07:00-20:00 (Mon-Fri)",
+        "base_cycle": {
+          "3": 75,
+          "4": 25,
+          "9": 35
+        }
+      }
+    ]
+  },
+  "cycle_duration_prior": {
+    "min_recommended": 60.0,
+    "max_recommended": 180.0,
+    "median": 135.0,
+    "p25": 100.0,
+    "p75": 160.0,
+    "peak_median": 160.0,
+    "offpeak_median": 100.0,
+    "observed_values": [
+      135.0,
+      160.0,
+      180.0
+    ]
+  },
+  "phase_green_prior": {
+    "min_green_recommended": 15.0,
+    "max_green_recommended": 120.0,
+    "typical_major_phase": [
+      50.0,
+      60.0,
+      75.0
+    ],
+    "typical_minor_phase": [
+      20.0,
+      25.0,
+      35.0
+    ],
+    "observed_major": [
+      50.0,
+      60.0,
+      75.0
+    ],
+    "observed_minor": [
+      20.0,
+      25.0,
+      35.0
+    ]
+  },
+  "micro_adjustment_prior": {
+    "max_extend_recommended": 8.0,
+    "max_shorten_recommended": 5.0,
+    "common_extend_seconds": [
+      3.0,
+      5.0,
+      8.0
+    ],
+    "common_shorten_seconds": [
+      -3.0,
+      -5.0
+    ],
+    "high_confidence_extend_conditions": [
+      "current_phase_queue_high",
+      "downstream_not_blocked",
+      "next_phase_pressure_low"
+    ],
+    "ai_micro_adjust_enabled": true,
+    "default_micro_weight": 10
+  },
+  "demand_patterns": {
+    "morning_peak_start": "07:30",
+    "morning_peak_end": "09:00",
+    "morning_peak_multiplier": 1.45,
+    "evening_peak_start": "17:00",
+    "evening_peak_end": "19:00",
+    "evening_peak_multiplier": 1.6,
+    "low_demand_multiplier": 0.35,
+    "midday_multiplier": 0.75,
+    "night_multiplier": 0.35,
+    "directional_imbalance_ratios": [
+      2.0,
+      3.0,
+      4.0
+    ],
+    "control_periods": [
+      {
+        "crossing_id": 1,
+        "start": "07:35",
+        "end": "19:20",
+        "days": "Mon-Fri"
+      },
+      {
+        "crossing_id": 2,
+        "start": "17:00",
+        "end": "18:00",
+        "days": "Mon-Fri"
+      },
+      {
+        "crossing_id": 10,
+        "start": "07:00",
+        "end": "20:00",
+        "days": "Mon-Fri"
+      }
+    ]
+  },
+  "prediction_error_prior": {
+    "horizon_seconds": [
+      30,
+      60,
+      120
+    ],
+    "mape_30s": 0.12,
+    "mape_60s": 0.18,
+    "mape_120s": 0.27,
+    "peak_error_multiplier": 1.3,
+    "total_prediction_records": 270367,
+    "direction_count": 12
+  },
+  "coordination_prior": {
+    "use_one_hop_neighbors": true,
+    "offset_sensitive": true,
+    "downstream_spillback_sensitive": true,
+    "typical_offset_range_s": [
+      0.0,
+      30.0
+    ],
+    "green_wave_speed_ms": 13.9,
+    "wave_types": [
+      "green_wave",
+      "red_wave"
+    ],
+    "intervention_modes": [
+      "hard_cut",
+      "soft_cut",
+      "normal"
+    ]
+  },
+  "directional_imbalance_patterns": [
+    {
+      "name": "major_arterial",
+      "description": "干道 vs 支路，如剑南大道(48车道) vs 支路(15车道)",
+      "major_minor_ratio": 3.2,
+      "left_turn_multiplier": 0.8,
+      "pulse_interval_s": 0.0,
+      "pulse_width_s": 0.0
+    },
+    {
+      "name": "tide_flow",
+      "description": "潮汐流，早高峰进城方向 / 晚高峰出城方向",
+      "major_minor_ratio": 2.5,
+      "left_turn_multiplier": 1.0,
+      "pulse_interval_s": 60.0,
+      "pulse_width_s": 20.0
+    },
+    {
+      "name": "balanced_suburban",
+      "description": "近均衡路口，如新泽三路(15-25车道)",
+      "major_minor_ratio": 1.5,
+      "left_turn_multiplier": 1.0,
+      "pulse_interval_s": 0.0,
+      "pulse_width_s": 0.0
+    }
+  ]
+}

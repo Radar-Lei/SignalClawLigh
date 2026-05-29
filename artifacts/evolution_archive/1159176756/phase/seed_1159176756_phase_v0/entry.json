@@ -1,0 +1,38 @@
+{
+  "candidate_id": "seed_1159176756_phase_v0",
+  "crossing_id": "1159176756",
+  "skill_type": "phase",
+  "parent_ids": [],
+  "code": "\"\"\"Phase micro adjuster seed for intersection 1159176756.\"\"\"\nfrom typing import Dict, Optional\nfrom signalclaw.core.state import NetworkObservation, CyclePlan, PhaseCommand\n\n_extend_threshold = 3.0\n_max_extend = 5.0\n_decision_interval = 5.0\n\n_phase_index: int = 0\n_phase_remaining: float = 0.0\n_current_plan_hash: int = 0\n\n\ndef _plan_hash(plan: \"CyclePlan\") -> int:\n    return hash((plan.cycle_length, tuple(sorted(plan.green_times.items())), tuple(plan.phase_order)))\n\n\ndef decide(obs: \"NetworkObservation\", plan: \"CyclePlan\") -> \"PhaseCommand\":\n    global _phase_index, _phase_remaining, _current_plan_hash\n\n    ego = obs.ego\n    phase_order = plan.phase_order\n    if not phase_order:\n        return PhaseCommand(\n            action=\"hold\", next_phase_id=ego.current_phase_id,\n            duration=_decision_interval, reason_code=\"no_phases\",\n        )\n\n    ph = _plan_hash(plan)\n    if _current_plan_hash != ph:\n        _phase_index = 0\n        _current_plan_hash = ph\n        first_phase = phase_order[0]\n        _phase_remaining = plan.green_times.get(first_phase, 15.0)\n        return PhaseCommand(\n            action=\"switch\", next_phase_id=first_phase,\n            duration=plan.green_times.get(first_phase, 15.0),\n            reason_code=\"new_plan\",\n        )\n\n    remaining = _phase_remaining\n\n    if remaining <= 0:\n        next_idx = (_phase_index + 1) % len(phase_order)\n        next_phase = phase_order[next_idx]\n        _phase_index = next_idx\n        _phase_remaining = plan.green_times.get(next_phase, 15.0)\n        return PhaseCommand(\n            action=\"switch\", next_phase_id=next_phase,\n            duration=_phase_remaining, reason_code=\"phase_end\",\n        )\n\n    current_phase = phase_order[_phase_index]\n    phase_obs = ego.phases.get(current_phase)\n\n    if phase_obs is not None and remaining <= 10.0:\n        current_queue = phase_obs.queue\n        downstream_risk = sum(ego.downstream_queue.values()) if ego.downstream_queue else 0\n        if current_queue > _extend_threshold and downstream_risk < 10:\n            extend = min(_max_extend, _decision_interval)\n            _phase_remaining = remaining + extend - _decision_interval\n            return PhaseCommand(\n                action=\"extend\", next_phase_id=current_phase,\n                duration=_phase_remaining + _decision_interval,\n                reason_code=f\"extend_high_demand_q{current_queue:.0f}\",\n            )\n        if current_queue < 1.0 and remaining > 5.0:\n            _phase_remaining = 0\n            next_idx = (_phase_index + 1) % len(phase_order)\n            next_phase = phase_order[next_idx]\n            _phase_index = next_idx\n            _phase_remaining = plan.green_times.get(next_phase, 15.0)\n            return PhaseCommand(\n                action=\"switch\", next_phase_id=next_phase,\n                duration=_phase_remaining,\n                reason_code=f\"early_switch_empty_q{current_queue:.0f}\",\n            )\n\n    _phase_remaining -= _decision_interval\n    return PhaseCommand(\n        action=\"hold\", next_phase_id=current_phase,\n        duration=_decision_interval, reason_code=\"continuing\",\n    )\n\n\ndef _reset():\n    global _phase_index, _phase_remaining, _current_plan_hash\n    _phase_index = 0\n    _phase_remaining = 0.0\n    _current_plan_hash = 0\n",
+  "code_hash": "5e84873176c9525b2edf40b9d87d6570fe65578bd72b084050f2db708009c269",
+  "prompt": "",
+  "prompt_hash": "",
+  "glm_model": "seed",
+  "generation": 0,
+  "static_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [
+      "模块级状态变量: _extend_threshold（可能导致不确定性）",
+      "模块级状态变量: _max_extend（可能导致不确定性）",
+      "模块级状态变量: _decision_interval（可能导致不确定性）"
+    ],
+    "has_correct_interface": true,
+    "complexity_score": 12.3
+  },
+  "prior_check": null,
+  "replay_report": {
+    "candidate_id": "seed_1159176756_phase_v0",
+    "crossing_id": "1159176756",
+    "skill_type": "phase",
+    "passed": true,
+    "violations": [],
+    "score": 1.0,
+    "failure_cases": [],
+    "test_cases_run": 8
+  },
+  "sumo_report": null,
+  "selected": true,
+  "rejection_reason": "",
+  "created_at": "2026-05-29T08:44:25.505835+00:00"
+}

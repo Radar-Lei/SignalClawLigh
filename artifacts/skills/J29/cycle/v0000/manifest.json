@@ -1,0 +1,26 @@
+{
+  "skill_id": "tls_J29_cycle_v0000",
+  "crossing_id": "J29",
+  "skill_type": "cycle",
+  "version": 0,
+  "parent_skill_ids": [],
+  "code_hash": "8ff38a42238069edbc71e2dcacc35ce98d51f294e422211b62c2f135c9e6bb7f",
+  "prompt_hash": "5da04d8828bff36181d48e82b93e327d8585eac5996836e0d4f3250c15fc9588",
+  "data_split_hash": "",
+  "sumo_scenario_hash": "e456d119f812a3ce3112bcca2128f0e779155d3c2db44857fd91a8ec56dee268",
+  "glm_model": "seed",
+  "created_at": "2026-05-29T02:19:50.378321+00:00",
+  "frozen": true,
+  "online_learning": false,
+  "exploration": false,
+  "constraints_profile": "default",
+  "metrics": {
+    "replay_score": 0.0,
+    "sumo_score": 0.0,
+    "safety_violations": 0,
+    "phase_starvation_count": 0,
+    "mean_waiting": 0.0,
+    "mean_queue": 0.0,
+    "throughput": 0.0
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "candidate_id": "pha_432452987_r1_c1_67b9a3",
+  "crossing_id": "432452987",
+  "skill_type": "phase",
+  "parent_ids": [],
+  "code": "import math\n\n_decision_interval = 3.0\n_min_green = 10.0\n_max_green = 60.0\n_max_extend = 5.0\n_max_shorten = 5.0\n\n_extend_score_threshold = 2.5\n_early_switch_queue = 0.5\n_other_score_for_early = 5.0\n_shorten_queue_for_spillback = 1.0\n_downstream_queue_safe = 12.0\n_spillback_risk_safe = 0.5\n\n_phase_index = 0\n_phase_remaining = 0.0\n_current_plan_hash = 0\n\n\ndef _plan_hash(plan):\n    return hash((plan.cycle_length, tuple(sorted(plan.green_times.items())), tuple(plan.phase_order)))\n\n\ndef _calc_phase_score(phase_obs, ego):\n    \"\"\"计算相位评分，与CyclePlan的评分逻辑对齐\"\"\"\n    if phase_obs is None:\n        return 0.1\n    local_pressure = phase_obs.queue + phase_obs.predicted_arrival\n    hunger_bonus = phase_obs.waiting_time * 0.3\n    upstream_bonus = ego.upstream_release_pressure * 0.2\n    return max(local_pressure + hunger_bonus + upstream_bonus, 0.1)\n\n\ndef decide(obs, plan):\n    global _phase_index, _phase_remaining, _current_plan_hash\n\n    ego = obs.ego\n    phase_order = plan.phase_order\n\n    if not phase_order:\n        return PhaseCommand(\n            action=\"hold\", next_phase_id=ego.current_phase_id,\n            duration=_decision_interval, reason_code=\"no_phases\",\n        )\n\n    ph = _plan_hash(plan)\n    if _current_plan_hash != ph:\n        _phase_index = 0\n        _current_plan_hash = ph\n        first_phase = phase_order[0]\n        first_green = plan.green_times.get(first_phase, 15.0)\n        _phase_remaining = first_green\n        return PhaseCommand(\n            action=\"switch\", next_phase_id=first_phase,\n            duration=first_green, reason_code=\"new_plan\",\n        )\n\n    remaining = _phase_remaining\n    current_phase = phase_order[_phase_index]\n    phase_obs = ego.phases.get(current_phase)\n    current_queue = phase_obs.queue if phase_obs else 0.0\n\n    downstream_total = sum(ego.downstream_queue.values()) if ego.downstream_queue else 0.0\n    spillback_risk = ego.downstream_spillback_risk\n    downstream_safe = downstream_total < _downstream_queue_safe and spillback_risk < _spillback_risk_safe\n\n    current_score = _calc_phase_score(phase_obs, ego)\n\n    n_phases = len(phase_order)\n    next_idx = (_phase_index + 1) % n_phases\n    next_phase = phase_order[next_idx]\n    next_phase_obs = ego.phases.get(next_phase)\n    next_score = _calc_phase_score(next_phase_obs, ego)\n\n    other_total_score = 0.0\n    for i in range(n_phases):\n        if i != _phase_index:\n            po = ego.phases.get(phase_order[i])\n            other_total_score += _calc_phase_score(po, ego)\n\n    planned_green = plan.green_times.get(current_phase, 15.0)\n    elapsed_est = max(planned_green - remaining, 0.0)\n\n    # 1. Time expired -> switch\n    if remaining <= 0:\n        _phase_index = next_idx\n        next_green = plan.green_times.get(next_phase, 15.0)\n        _phase_remaining = next_green\n        return PhaseCommand(\n            action=\"switch\", next_phase_id=next_phase,\n            duration=next_green, reason_code=\"phase_end\",\n        )\n\n    # 2. Minimum green protection\n    if elapsed_est < _min_green:\n        _phase_remaining -= _decision_interval\n        return PhaseCommand(\n            action=\"hold\", next_phase_id=current_phase,\n            duration=_decision_interval, reason_code=\"min_green\",\n        )\n\n    # 3. Maximum green enforcement\n    if elapsed_est >= _max_green:\n        _phase_index = next_idx\n        next_green = plan.green_times.get(next_phase, 15.0)\n        _phase_remaining = next_green\n        return PhaseCommand(\n            action=\"switch\", next_phase_id=next_phase,\n            duration=next_green, reason_code=\"max_green_reached\",\n        )\n\n    # 4. Second half fine-tuning\n    if remaining <= planned_green * 0.5:\n        # 4a. High demand + downstream safe -> extend\n        if current_score > _extend_score_threshold and downstream_safe:\n            extend_amount = min(_max_extend, current_score * 0.4)\n            if extend_amount > 0:\n                new_remaining = remaining + extend_amount\n                _phase_remaining = new_remaining - _decision_interval\n                return PhaseCommand(\n                    action=\"extend\", next_phase_id=current_phase,\n                    duration=new_remaining,\n                    reason_code=f\"extend_s{current_score:.1f}\",\n                )\n\n        # 4b. Empty phase + other demand -> early switch\n        if current_queue < _early_switch_queue and other_total_score > _other_score_for_early:\n            _phase_index = next_idx\n            next_green = plan.green_times.get(next_phase, 15.0)\n            _phase_remaining = next_green\n            return PhaseCommand(\n                action=\"switch\", next_phase_id=next_phase,\n                duration=next_green, reason_code=\"early_switch_empty\",\n            )\n\n        # 4c. Spillback risk + low demand -> shorten\n        if not downstream_safe and current_queue < _shorten_queue_for_spillback:\n            shorten_amount = min(_max_shorten, remaining * 0.4)\n            if shorten_amount > 0:\n                new_remaining = remaining - shorten_amount\n                _phase_remaining = new_remaining\n                return PhaseCommand(\n                    action=\"shorten\", next_phase_id=current_phase,\n                    duration=new_remaining, reason_code=\"shorten_spillback\",\n                )\n\n        # 4d. Next phase much higher demand -> moderate shorten\n        if next_score > current_score * 2.0 and next_score > 3.0:\n            shorten_amount = min(_max_shorten * 0.5, remaining * 0.3)\n            if shorten_amount > 0:\n                new_remaining = remaining - shorten_amount\n                _phase_remaining = new_remaining\n                return PhaseCommand(\n                    action=\"shorten\", next_phase_id=current_phase,\n                    duration=new_remaining, reason_code=\"shorten_next_demand\",\n                )\n\n    # 5. Normal hold\n    _phase_remaining -= _decision_interval\n    return PhaseCommand(\n        action=\"hold\", next_phase_id=current_phase,\n        duration=_decision_interval, reason_code=\"continuing\",\n    )",
+  "code_hash": "c945d6baf6d0f6fd7500a6a4e9471a8c3ce679a5a1c1679f816138514d5764aa",
+  "prompt": "# 路口特征\n路口 ID: 432452987\n相位数量: 4\n最小绿灯: 10.0s\n最大绿灯: 60.0s\n最小周期: 40.0s\n最大周期: 180.0s\n黄灯时间: 3.0s\n全红时间: 2.0s\n最大延长: 5.0s\n最大缩短: 5.0s\n强制相位: 无\n\n\n# 约束条件\n  min_green: 10.0\n  max_green: 60.0\n  min_cycle: 40.0\n  max_cycle: 180.0\n  yellow_time: 3.0\n  all_red_time: 2.0\n  max_extend: 5.0\n  max_shorten: 5.0\n  force_phase_ids: set()\n\n# 配对的 CyclePlan 算法代码（只读参考）\n```python\ndef plan(obs):\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    if not green_phases:\n        return CyclePlan(cycle_length=80.0, green_times={}, phase_order=[])\n\n    yellow_time = 3.0\n    all_red_time = 2.0\n    min_green = 10.0\n    max_green = 60.0\n    min_cycle = 40.0\n    max_cycle = 180.0\n\n    total_loss_time = len(green_phases) * (yellow_time + all_red_time)\n\n    total_queue = sum(p.queue for p in ego.phases.values())\n\n    base_cycle = 80.0\n    if total_queue < 5:\n        cycle_length = base_cycle * 0.8\n    elif total_queue > 50:\n        cycle_length = base_cycle * 1.4\n    else:\n        cycle_length = base_cycle * (0.8 + 0.6 * (total_queue - 5) / 45.0)\n\n    cycle_length = max(min_cycle, min(max_cycle, cycle_length))\n\n    if ego.downstream_spillback_risk > 0.5:\n        cycle_length = max(min_cycle, cycle_length * 0.9)\n\n    min_effective_green = len(green_phases) * min_green\n    if cycle_length - total_loss_time < min_effective_green:\n        cycle_length = min_effective_green + total_loss_time\n    cycle_length = min(cycle_length, max_cycle)\n\n    effective_green = cycle_length - total_loss_time\n\n    downstream_total = sum(ego.downstream_queue.values()) if ego.downstream_queue else 0.0\n    n_downstream = max(len(ego.downstream_queue), 1)\n    avg_downstream = downstream_total / n_downstream\n    spillback_penalty = max(0.0, avg_downstream - 5.0) * 2.0\n\n    scores = {}\n    for gp in green_phases:\n        p = ego.phases.get(gp)\n        if p is None:\n            scores[gp] = 0.1\n            continue\n\n        local_pressure = p.queue + p.predicted_arrival\n        hunger_bonus = p.waiting_time * 0.3\n        ",
+  "prompt_hash": "8b8bf81606ae04e0e522a5e254eb83e06602fad4bd3b1bb058acbe00d0d8f6b2",
+  "glm_model": "glm-5.1",
+  "generation": 1,
+  "static_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [
+      "模块级状态变量: _decision_interval（可能导致不确定性）",
+      "模块级状态变量: _min_green（可能导致不确定性）",
+      "模块级状态变量: _max_green（可能导致不确定性）",
+      "模块级状态变量: _max_extend（可能导致不确定性）",
+      "模块级状态变量: _max_shorten（可能导致不确定性）",
+      "模块级状态变量: _extend_score_threshold（可能导致不确定性）",
+      "模块级状态变量: _early_switch_queue（可能导致不确定性）",
+      "模块级状态变量: _other_score_for_early（可能导致不确定性）",
+      "模块级状态变量: _shorten_queue_for_spillback（可能导致不确定性）",
+      "模块级状态变量: _downstream_queue_safe（可能导致不确定性）",
+      "模块级状态变量: _spillback_risk_safe（可能导致不确定性）",
+      "模块级状态变量: _phase_index（可能导致不确定性）",
+      "模块级状态变量: _phase_remaining（可能导致不确定性）",
+      "模块级状态变量: _current_plan_hash（可能导致不确定性）"
+    ],
+    "has_correct_interface": true,
+    "complexity_score": 25.1
+  },
+  "prior_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [
+      "代码中存在可能产生过大延长幅度的数值: 60.0s (先验上限: 8s)"
+    ],
+    "score": 0.9
+  },
+  "replay_report": {
+    "candidate_id": "pha_432452987_r1_c1_67b9a3",
+    "crossing_id": "432452987",
+    "skill_type": "phase",
+    "passed": true,
+    "violations": [],
+    "score": 1.0,
+    "failure_cases": [],
+    "test_cases_run": 8
+  },
+  "sumo_report": null,
+  "selected": false,
+  "rejection_reason": "",
+  "created_at": "2026-05-29T14:51:47.717838+00:00"
+}

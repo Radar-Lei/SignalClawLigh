@@ -1,5 +1,12 @@
 import sys
 import os
+
+# 确保 SUMO tools 在 sys.path 中（支持非标准安装位置）
+_sumo_home = os.environ.get("SUMO_HOME", "/usr/share/sumo")
+_sumo_tools = os.path.join(_sumo_home, "tools")
+if _sumo_tools not in sys.path:
+    sys.path.insert(0, _sumo_tools)
+
 import traci
 import sumolib
 from collections import defaultdict

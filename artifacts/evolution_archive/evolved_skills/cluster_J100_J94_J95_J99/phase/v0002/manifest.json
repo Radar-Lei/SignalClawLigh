@@ -1,0 +1,26 @@
+{
+  "skill_id": "tls_cluster_J100_J94_J95_J99_phase_v0002",
+  "crossing_id": "cluster_J100_J94_J95_J99",
+  "skill_type": "phase",
+  "version": 2,
+  "parent_skill_ids": [],
+  "code_hash": "89c7b0e66ef01a6046805e36ef34f7c974a8d995a1899a028fdb31154a85409c",
+  "prompt_hash": "e35d40195a7040c22943fa163308e340f92c4c75f61ac3dcaa41916b5198af8e",
+  "data_split_hash": "",
+  "sumo_scenario_hash": "",
+  "glm_model": "glm-5.1",
+  "created_at": "2026-05-29T13:00:27.849360+00:00",
+  "frozen": true,
+  "online_learning": false,
+  "exploration": false,
+  "constraints_profile": "default",
+  "metrics": {
+    "replay_score": 1.0,
+    "sumo_score": 0.0,
+    "safety_violations": 0,
+    "phase_starvation_count": 0,
+    "mean_waiting": 0.0,
+    "mean_queue": 0.0,
+    "throughput": 0.0
+  }
+}

@@ -1,0 +1,102 @@
+{
+  "1159176756": {
+    "crossing_id": "1159176756",
+    "cycle_best_id": "cyc_1159176756_r1_c1_d6f707",
+    "phase_best_id": "seed_1159176756_phase_v0",
+    "cycle_score": 0.958,
+    "phase_score": 1.0,
+    "cycle_seed_score": 0.8958,
+    "phase_seed_score": 1.0,
+    "cycle_improvement": 0.0622
+  },
+  "1388442962": {
+    "crossing_id": "1388442962",
+    "cycle_best_id": "cyc_1388442962_r1_c0_559e6e",
+    "phase_best_id": "pha_1388442962_r2_c0_17af9d",
+    "cycle_score": 0.9629,
+    "phase_score": 1.0,
+    "cycle_seed_score": 0.8958,
+    "phase_seed_score": 1.0,
+    "cycle_improvement": 0.0671
+  },
+  "1492574988": {
+    "crossing_id": "1492574988",
+    "cycle_best_id": "cyc_1492574988_r1_c0_4bb193",
+    "phase_best_id": "pha_1492574988_r1_c1_9966c3",
+    "cycle_score": 0.9577,
+    "phase_score": 1.0,
+    "cycle_seed_score": 0.8958,
+    "phase_seed_score": 1.0,
+    "cycle_improvement": 0.0619
+  },
+  "cluster_J100_J94_J95_J99": {
+    "crossing_id": "cluster_J100_J94_J95_J99",
+    "cycle_best_id": "cyc_cluster_J100_J94_J95_J99_r1_c0_99a38e",
+    "phase_best_id": "pha_cluster_J100_J94_J95_J99_r1_c0_b1ad50",
+    "cycle_score": 0.949,
+    "phase_score": 1.0,
+    "cycle_seed_score": 0.8958,
+    "phase_seed_score": 1.0,
+    "cycle_improvement": 0.0532
+  },
+  "314635491": {
+    "crossing_id": "314635491",
+    "cycle_best_id": "cyc_314635491_r1_c0_baeb66",
+    "phase_best_id": "seed_314635491_phase_v0",
+    "cycle_score": 0.9968,
+    "phase_score": 1.0,
+    "cycle_seed_score": 0.8958,
+    "phase_seed_score": 1.0,
+    "cycle_improvement": 0.101
+  },
+  "1492645720": {
+    "crossing_id": "1492645720",
+    "cycle_best_id": "cyc_1492645720_r1_c0_1f59c1",
+    "phase_best_id": "pha_1492645720_r2_c0_1bc732",
+    "cycle_score": 0.9442,
+    "phase_score": 1.0,
+    "cycle_seed_score": 0.8958,
+    "phase_seed_score": 1.0,
+    "cycle_improvement": 0.0484
+  },
+  "4701464324": {
+    "crossing_id": "4701464324",
+    "cycle_best_id": "cyc_4701464324_r1_c0_d3d1fc",
+    "phase_best_id": "pha_4701464324_r2_c0_6d648a",
+    "cycle_score": 0.9569,
+    "phase_score": 1.0,
+    "cycle_seed_score": 0.8958,
+    "phase_seed_score": 1.0,
+    "cycle_improvement": 0.0611
+  },
+  "432452989": {
+    "crossing_id": "432452989",
+    "cycle_best_id": "cyc_432452989_r1_c0_4c1332",
+    "phase_best_id": "seed_432452989_phase_v0",
+    "cycle_score": 0.9552,
+    "phase_score": 1.0,
+    "cycle_seed_score": 0.8958,
+    "phase_seed_score": 1.0,
+    "cycle_improvement": 0.0594
+  },
+  "432452987": {
+    "crossing_id": "432452987",
+    "cycle_best_id": "cyc_432452987_r1_c0_344351",
+    "phase_best_id": "pha_432452987_r1_c0_f38c2b",
+    "cycle_score": 0.951,
+    "phase_score": 1.0,
+    "cycle_seed_score": 0.8958,
+    "phase_seed_score": 1.0,
+    "cycle_improvement": 0.0552
+  },
+  "314655170": {
+    "crossing_id": "314655170",
+    "cycle_best_id": "cyc_314655170_r1_c0_34bfe5",
+    "phase_best_id": "seed_314655170_phase_v0",
+    "cycle_score": 0.9706,
+    "phase_score": 1.0,
+    "cycle_seed_score": 0.8958,
+    "phase_seed_score": 1.0,
+    "cycle_improvement": 0.0748
+  }
+}

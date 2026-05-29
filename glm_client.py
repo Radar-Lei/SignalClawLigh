@@ -70,7 +70,7 @@ class GLMClient:
 
         payload = self._build_payload(messages, temperature, max_tokens, stream=False)
         resp = requests.post(
-            self.endpoint, headers=self._build_headers(), json=payload, timeout=120
+            self.endpoint, headers=self._build_headers(), json=payload, timeout=600
         )
         resp.raise_for_status()
         data = resp.json()

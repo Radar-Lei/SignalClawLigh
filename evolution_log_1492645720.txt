@@ -1,0 +1,12 @@
+[evolution] 加载 seed cohort: artifacts/skills/cohorts/seed_cohort.json
+[evolution] 共 46 个路口
+[evolution] 使用默认 SQL 参考画像
+
+[evolution] === 路口 1492645720 (1/1) ===
+[evolution] 1492645720 完成: cycle_score=0.9430, phase_score=1.0000
+
+[evolution] Evolved cohort 保存到: artifacts/evolution_archive/evolved_cohort.json
+[evolution] 进化摘要保存到: artifacts/evolution_archive/evolution_summary.json
+
+[evolution] 完成: 1/1 个路口成功进化
+[evolution] Archive 总条目: 40

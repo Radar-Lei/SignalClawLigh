@@ -1,0 +1,54 @@
+{
+  "version": "1.0",
+  "scenarios": [
+    {
+      "name": "base",
+      "route_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_base.rou.xml",
+      "weight": 1.0,
+      "description": "基准场景，使用原始需求模式",
+      "sumocfg_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_base.sumocfg"
+    },
+    {
+      "name": "morning_peak",
+      "route_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_morning_peak.rou.xml",
+      "weight": 1.2,
+      "description": "早高峰场景，demand 1.45x，集中在前半段 900-1800s",
+      "sumocfg_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_morning_peak.sumocfg"
+    },
+    {
+      "name": "evening_peak",
+      "route_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_evening_peak.rou.xml",
+      "weight": 1.2,
+      "description": "晚高峰场景，demand 1.60x，集中在后半段 1800-3000s",
+      "sumocfg_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_evening_peak.sumocfg"
+    },
+    {
+      "name": "low_demand",
+      "route_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_low_demand.rou.xml",
+      "weight": 0.8,
+      "description": "低需求场景，demand 0.35x",
+      "sumocfg_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_low_demand.sumocfg"
+    },
+    {
+      "name": "mainroad_imbalance",
+      "route_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_mainroad_imbalance.rou.xml",
+      "weight": 1.0,
+      "description": "主路偏重场景，主路方向 3x，支路 0.5x",
+      "sumocfg_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_mainroad_imbalance.sumocfg"
+    },
+    {
+      "name": "leftturn_surge",
+      "route_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_leftturn_surge.rou.xml",
+      "weight": 1.0,
+      "description": "左转突增场景，左转相位相关方向 2.2x",
+      "sumocfg_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_leftturn_surge.sumocfg"
+    },
+    {
+      "name": "mixed_stress",
+      "route_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_mixed_stress.rou.xml",
+      "weight": 1.5,
+      "description": "混合压力场景，1.3x + 方向不均衡 + 波动",
+      "sumocfg_file": "/home/samuel/projects/signalclaw/sumo_scenarios/chengdu/generated/chengdu_mixed_stress.sumocfg"
+    }
+  ]
+}

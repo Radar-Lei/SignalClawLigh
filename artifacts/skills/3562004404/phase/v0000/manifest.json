@@ -1,0 +1,26 @@
+{
+  "skill_id": "tls_3562004404_phase_v0000",
+  "crossing_id": "3562004404",
+  "skill_type": "phase",
+  "version": 0,
+  "parent_skill_ids": [],
+  "code_hash": "246bed9ea810454f6c805256c5414e091354b7c9706ec5820a70383c9afc002b",
+  "prompt_hash": "b83055067724f452d60d1005c9674b2c847744281d29391658e983c5eed95ac4",
+  "data_split_hash": "",
+  "sumo_scenario_hash": "e456d119f812a3ce3112bcca2128f0e779155d3c2db44857fd91a8ec56dee268",
+  "glm_model": "seed",
+  "created_at": "2026-05-29T02:19:50.375372+00:00",
+  "frozen": true,
+  "online_learning": false,
+  "exploration": false,
+  "constraints_profile": "default",
+  "metrics": {
+    "replay_score": 0.0,
+    "sumo_score": 0.0,
+    "safety_violations": 0,
+    "phase_starvation_count": 0,
+    "mean_waiting": 0.0,
+    "mean_queue": 0.0,
+    "throughput": 0.0
+  }
+}

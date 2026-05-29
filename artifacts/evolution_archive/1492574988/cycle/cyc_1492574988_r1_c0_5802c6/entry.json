@@ -1,0 +1,112 @@
+{
+  "candidate_id": "cyc_1492574988_r1_c0_5802c6",
+  "crossing_id": "1492574988",
+  "skill_type": "cycle",
+  "parent_ids": [],
+  "code": "import math\n\n\ndef plan(obs):\n    \"\"\"Improved cycle planner for intersection 1492574988.\"\"\"\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    \n    # Boundary case: no phases\n    if not green_phases:\n        return CyclePlan(\n            cycle_length=80.0, \n            green_times={}, \n            phase_order=[],\n            offset_target=0.0\n        )\n    \n    # Constants\n    MIN_GREEN = 10.0\n    MAX_GREEN = 60.0\n    MIN_CYCLE = 40.0\n    MAX_CYCLE = 180.0\n    YELLOW_TIME = 3.0\n    ALL_RED_TIME = 2.0\n    \n    num_phases = len(green_phases)\n    total_loss_time = num_phases * (YELLOW_TIME + ALL_RED_TIME)\n    \n    # =============================================\n    # Part 1: Calculate comprehensive pressure scores\n    # =============================================\n    scores = {}\n    total_queue = 0.0\n    total_waiting = 0.0\n    \n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            scores[gp] = 0.1\n            continue\n        \n        total_queue += phase_obs.queue\n        total_waiting += phase_obs.waiting_time\n        \n        # 1. Queue pressure (linear, core metric)\n        queue_component = phase_obs.queue * 1.0\n        \n        # 2. Waiting time pressure (sqrt growth to prevent extreme bias)\n        wait_component = math.sqrt(max(phase_obs.waiting_time, 0.0)) * 1.5\n        \n        # 3. Predicted arrivals\n        arrival_component = phase_obs.predicted_arrival * 0.5\n        \n        # 4. Saturation factor\n        if phase_obs.saturation_flow > 0:\n            saturation_ratio = min(\n                phase_obs.queue / phase_obs.saturation_flow, \n                2.0\n            )\n            sat_component = saturation_ratio * 3.0\n        else:\n            sat_component = 0.0\n        \n        # 5. Upstream release pressure (positive)\n        upstream_component = ego.upstream_release_pressure * 0.3\n        \n        # 6. Downstream spillback risk (negative)\n        spillback_component = ego.downstream_spillback_risk * 1.5\n        \n        # Combined score\n        score = (queue_component \n                + wait_component \n                + arrival_component \n                + sat_component \n                + upstream_component \n                - spillback_component)\n        \n        scores[gp] = max(score, 0.1)\n    \n    # =============================================\n    # Part 2: Estimate optimal cycle length\n    # =============================================\n    avg_waiting = total_waiting / max(num_phases, 1)\n    \n    # Piecewise linear cycle estimation based on queue\n    if total_queue <= 0:\n        target_cycle = MIN_CYCLE\n    elif total_queue <= 5:\n        target_cycle = 55.0\n    elif total_queue <= 15:\n        target_cycle = 55.0 + (total_queue - 5.0) * 2.0\n    elif total_queue <= 40:\n        target_cycle = 75.0 + (total_queue - 15.0) * 1.2\n    elif total_queue <= 80:\n        target_cycle = 105.0 + (total_queue - 40.0) * 0.75\n    else:\n        target_cycle = 135.0 + min((total_queue - 80.0) * 0.3, 25.0)\n    \n    # Waiting time correction\n    if avg_waiting > 60:\n        target_cycle *= 1.2\n    elif avg_waiting > 30:\n        target_cycle *= 1.1\n    elif avg_waiting < 5 and total_queue < 3:\n        target_cycle *= 0.85\n    \n    # Downstream spillback risk correction (shorten cycle to reduce accumulation)\n    if ego.downstream_spillback_risk > 0.3:\n        spillback_factor = 1.0 - 0.1 * min(ego.downstream_spillback_risk, 1.0)\n        target_cycle *= spillback_factor\n    \n    # Upstream release pressure correction (lengthen cycle for backlog)\n    if ego.upstream_release_pressure > 1.0:\n        upstream_factor = 1.0 + 0.05 * min(ego.upstream_release_pressure, 2.0)\n        target_cycle *= upstream_factor\n    \n    target_cycle = max(MIN_CYCLE, min(MAX_CYCLE, target_cycle))\n    \n    # =============================================\n    # Part 3: Allocate green times\n    # =============================================\n    available_green = target_cycle - total_loss_time\n    \n    # Ensure minimum green requirements\n    min_total_green = num_phases * MIN_GREEN\n    if available_green < min_total_green:\n        available_green = min_total_green\n        target_cycle = available_green + total_loss_time\n        target_cycle = min(target_cycle, MAX_CYCLE)\n    \n    # Proportional allocation based on scores\n    total_score = sum(scores.values())\n    green_times = {}\n    \n    for gp in green_phases:\n        if total_score > 0:\n            ratio = scores[gp] / total_score\n        else:\n            ratio = 1.0 / num_phases\n        green_times[gp] = available_green * ratio\n    \n    # =============================================\n    # Part 4: Apply green time constraints\n    # =============================================\n    \n    # Step 1: Clamp each phase to [MIN_GREEN, MAX_GREEN]\n    for gp in green_phases:\n        green_times[gp] = max(MIN_GREEN, min(MAX_GREEN, green_times[gp]))\n    \n    # Step 2: Check total cycle constraints\n    actual_green_sum = sum(green_times.values())\n    actual_cycle = actual_green_sum + total_loss_time\n    \n    # If exceeding max cycle, reduce green times\n    if actual_cycle > MAX_CYCLE:\n        excess = actual_cycle - MAX_CYCLE\n        reducible = [(gp, green_times[gp]) for gp in green_phases if green_times[gp] > MIN_GREEN]\n        reducible.sort(key=lambda x: x[1], reverse=True)\n        remaining = excess\n        for gp, gt in reducible:\n            if remaining <= 0:\n                break\n            reduction = min(gt - MIN_GREEN, remaining)\n            green_times[gp] -= reduction\n            remaining -= reduction\n    \n    # If below min cycle, extend green times\n    actual_green_sum = sum(green_times.values())\n    actual_cycle = actual_green_sum + total_loss_time\n    \n    if actual_cycle < MIN_CYCLE:\n        deficit = MIN_CYCLE - actual_cycle\n        extendable = [(gp, scores.get(gp, 0)) for gp in green_phases if green_times[gp] < MAX_GREEN]\n        extendable.sort(key=lambda x: x[1], reverse=True)\n        remaining = deficit\n        for gp, _ in extendable:\n            if remaining <= 0:\n                break\n            extension = min(MAX_GREEN - green_times[gp], remaining)\n            green_times[gp] += extension\n            remaining -= extension\n    \n    final_cycle = sum(green_times.values()) + total_loss_time\n    final_cycle = max(MIN_CYCLE, min(MAX_CYCLE, final_cycle))\n    \n    # =============================================\n    # Part 5: Calculate offset for coordination\n    # =============================================\n    offset_target = 0.0\n    \n    if obs.neighbors and final_cycle > 0:\n        total_neighbor_queue = 0.0\n        neighbor_count = 0\n        \n        for neighbor_id, neighbor_obs in obs.neighbors.items():\n            if hasattr(neighbor_obs, 'phases') and neighbor_obs.phases:\n                neighbor_queue = sum(p.queue for p in neighbor_obs.phases.values())\n                total_neighbor_queue += neighbor_queue\n                neighbor_count += 1\n        \n        if neighbor_count > 0:\n            # Estimate green wave offset based on travel time\n            estimated_travel_time = 20.0\n            offset_target = estimated_travel_time % final_cycle\n    \n    return CyclePlan(\n        cycle_length=final_cycle,\n        green_times=green_times,\n        phase_order=green_phases,\n        offset_target=offset_target\n    )",
+  "code_hash": "ddedc7601f5bd81736743db4f6bf5d91123036d59416171544d87036661754b7",
+  "prompt": "# 路口特征\n路口 ID: 1492574988\n相位数量: 4\n最小绿灯: 10.0s\n最大绿灯: 60.0s\n最小周期: 40.0s\n最大周期: 180.0s\n黄灯时间: 3.0s\n全红时间: 2.0s\n最大延长: 5.0s\n最大缩短: 5.0s\n强制相位: 无\n\n\n# 约束条件\n  min_green: 10.0\n  max_green: 60.0\n  min_cycle: 40.0\n  max_cycle: 180.0\n  yellow_time: 3.0\n  all_red_time: 2.0\n  max_extend: 5.0\n  max_shorten: 5.0\n  force_phase_ids: set()\n\n# 父代算法代码\n```python\n\"\"\"Cycle planner seed for intersection 1492574988.\"\"\"\nfrom collections import deque\nfrom typing import Dict, List, Optional\nfrom signalclaw.core.state import NetworkObservation, CyclePlan\n\n_min_green = 10.0\n_max_green = 60.0\n_base_cycle = 80.0\n_history_window = 5\n\n_pressure_history: Dict[int, deque] = {}\n_last_green_time: Dict[int, float] = {}\n\n\ndef _get_history(phase_id: int) -> deque:\n    if phase_id not in _pressure_history:\n        _pressure_history[phase_id] = deque(maxlen=_history_window)\n    return _pressure_history[phase_id]\n\n\ndef plan(obs: \"NetworkObservation\") -> \"CyclePlan\":\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    if not green_phases:\n        return CyclePlan(cycle_length=_base_cycle, green_times={}, phase_order=[])\n\n    scores = {}\n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            scores[gp] = 0.0\n            continue\n        local_pressure = phase_obs.queue\n        downstream_total = sum(ego.downstream_queue.values()) if ego.downstream_queue else 0.0\n        n_downstream = max(len(ego.downstream_queue), 1)\n        avg_downstream = downstream_total / n_downstream\n        spillback_risk = max(0, avg_downstream - 5.0) * 2.0\n        arrival_prediction = phase_obs.waiting_time * 0.3\n        last_served = _last_green_time.get(gp, 0)\n        hunger_time = obs.timestamp - last_served\n        hunger_bonus = min(hunger_time * 0.5, 15.0)\n        score = (\n            1.0 * local_pressure\n            + 0.4 * arrival_prediction\n            - 0.8 * spillback_risk\n            + 0.6 * hunger_bonus\n        )\n        scores[gp] = score\n        _get_history",
+  "prompt_hash": "fcb1bacffde253b1c8b89a32b6d7b28460a932ef02a761752fe5cfb880652dd9",
+  "glm_model": "glm-5.1",
+  "generation": 1,
+  "static_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [],
+    "has_correct_interface": true,
+    "complexity_score": 34.5
+  },
+  "prior_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [
+      "代码中存在可能产生极端周期时长的数值: 1492574988.0s (先验上限: 180s)"
+    ],
+    "score": 0.9
+  },
+  "replay_report": {
+    "candidate_id": "cyc_1492574988_r1_c0_5802c6",
+    "crossing_id": "1492574988",
+    "skill_type": "cycle",
+    "passed": true,
+    "violations": [],
+    "score": 0.95,
+    "failure_cases": [
+      {
+        "scenario": "normal",
+        "violation": "prior_warning",
+        "detail": "[normal][prior] phase 2 green_time=11.2s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 0 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 1 green_time=12.5s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 2 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 3 green_time=10.7s < 先验下限 15s"
+      },
+      {
+        "scenario": "extreme_imbalance",
+        "violation": "prior_warning",
+        "detail": "[extreme_imbalance][prior] phase 1 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "extreme_imbalance",
+        "violation": "prior_warning",
+        "detail": "[extreme_imbalance][prior] phase 2 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "extreme_imbalance",
+        "violation": "prior_warning",
+        "detail": "[extreme_imbalance][prior] phase 3 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "six_phase",
+        "violation": "prior_warning",
+        "detail": "[six_phase][prior] phase 0 green_time=11.2s < 先验下限 15s"
+      },
+      {
+        "scenario": "six_phase",
+        "violation": "prior_warning",
+        "detail": "[six_phase][prior] phase 1 green_time=13.6s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 0 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 1 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 2 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 3 green_time=10.0s < 先验下限 15s"
+      }
+    ],
+    "test_cases_run": 8
+  },
+  "sumo_report": null,
+  "selected": false,
+  "rejection_reason": "",
+  "created_at": "2026-05-29T10:14:49.990939+00:00"
+}

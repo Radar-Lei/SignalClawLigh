@@ -1,0 +1,26 @@
+{
+  "skill_id": "tls_cluster_4580811894_J22_J30_J5_cycle_v0000",
+  "crossing_id": "cluster_4580811894_J22_J30_J5",
+  "skill_type": "cycle",
+  "version": 0,
+  "parent_skill_ids": [],
+  "code_hash": "9c70e92f0105a341c2ccf2ee7d8f4178686b033e598a296e95c899303efa2c56",
+  "prompt_hash": "e36841dae223cd8cd1f44bd0a1e6e07f3c90408e0813bcf01dafd016653c26b0",
+  "data_split_hash": "",
+  "sumo_scenario_hash": "e456d119f812a3ce3112bcca2128f0e779155d3c2db44857fd91a8ec56dee268",
+  "glm_model": "seed",
+  "created_at": "2026-05-29T02:19:50.381428+00:00",
+  "frozen": true,
+  "online_learning": false,
+  "exploration": false,
+  "constraints_profile": "default",
+  "metrics": {
+    "replay_score": 0.0,
+    "sumo_score": 0.0,
+    "safety_violations": 0,
+    "phase_starvation_count": 0,
+    "mean_waiting": 0.0,
+    "mean_queue": 0.0,
+    "throughput": 0.0
+  }
+}

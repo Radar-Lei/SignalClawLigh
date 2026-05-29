@@ -1,0 +1,27 @@
+{
+  "candidate_id": "pha_1492574988_r1_c0_880ae4",
+  "crossing_id": "1492574988",
+  "skill_type": "phase",
+  "parent_ids": [],
+  "code": "",
+  "code_hash": "",
+  "prompt": "# 路口特征\n路口 ID: 1492574988\n相位数量: 4\n最小绿灯: 10.0s\n最大绿灯: 60.0s\n最小周期: 40.0s\n最大周期: 180.0s\n黄灯时间: 3.0s\n全红时间: 2.0s\n最大延长: 5.0s\n最大缩短: 5.0s\n强制相位: 无\n\n\n# 约束条件\n  min_green: 10.0\n  max_green: 60.0\n  min_cycle: 40.0\n  max_cycle: 180.0\n  yellow_time: 3.0\n  all_red_time: 2.0\n  max_extend: 5.0\n  max_shorten: 5.0\n  force_phase_ids: set()\n\n# 配对的 CyclePlan 算法代码（只读参考）\n```python\nimport math\n\n_min_green = 10.0\n_max_green = 60.0\n_min_cycle = 40.0\n_max_cycle = 180.0\n\n_last_green_time = {}\n\n\ndef plan(obs):\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    num_phases = len(green_phases)\n\n    if not green_phases:\n        return CyclePlan(cycle_length=80.0, green_times={}, phase_order=[])\n\n    # === Compute phase demand scores ===\n    scores = {}\n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            scores[gp] = 0.5\n            continue\n\n        queue = phase_obs.queue\n        arrivals = phase_obs.predicted_arrival\n        waiting = phase_obs.waiting_time\n        sat_flow = max(phase_obs.saturation_flow, 1.0)\n\n        # Hunger factor - how long since phase was last served\n        last_served = _last_green_time.get(gp, 0)\n        hunger = obs.timestamp - last_served\n        hunger_factor = min(hunger / 45.0, 2.0)\n\n        # Saturation-degree-based green time need\n        total_demand = queue + 0.5 * arrivals\n        green_need = total_demand / sat_flow * 60.0\n\n        # Waiting urgency - non-linear to prevent starvation\n        wait_urgency = min(waiting / 20.0, 3.0)\n\n        score = green_need + 2.0 * wait_urgency + 1.5 * hunger_factor\n        scores[gp] = max(score, 0.1)\n\n    # === Downstream spillback adjustment ===\n    spillback = ego.downstream_spillback_risk\n    if spillback > 0.3:\n        factor = max(0.4, 1.0 - 0.35 * min(spillback, 1.5))\n        for gp in green_phases:\n            scores[gp] *= factor\n\n    # === Upstream release pressure adjustment ===\n    upstream = ego.upstream_release_pressure\n    if upstream > 0.3:\n ",
+  "prompt_hash": "b09c33287fe2f3c33955af343a3e337b8014951def78512223cd0c0807b82905",
+  "glm_model": "glm-5.1",
+  "generation": 1,
+  "static_check": {
+    "passed": false,
+    "violations": [
+      "phase skill 必须定义 decide() 函数"
+    ],
+    "warnings": [],
+    "has_correct_interface": false,
+    "complexity_score": 1.0
+  },
+  "prior_check": null,
+  "replay_report": null,
+  "sumo_report": null,
+  "selected": false,
+  "rejection_reason": "AST 检查失败: phase skill 必须定义 decide() 函数",
+  "created_at": "2026-05-29T11:55:23.116682+00:00"
+}

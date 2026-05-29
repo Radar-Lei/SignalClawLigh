@@ -1,0 +1,10 @@
+[evolution] 加载 seed cohort: artifacts/skills/cohorts/seed_cohort.json
+[evolution] 共 46 个路口
+[evolution] 使用默认 SQL 参考画像
+
+[evolution] === 路口 1492574988 (1/1) ===
+[glm_mutator] GLM 调用异常 (attempt 1/3): HTTPSConnectionPool(host='open.bigmodel.cn', port=443): Read timed out. (read timeout=600)
+[glm_mutator] GLM 调用异常 (attempt 2/3): HTTPSConnectionPool(host='open.bigmodel.cn', port=443): Read timed out. (read timeout=600)
+[glm_mutator] GLM 调用异常 (attempt 3/3): HTTPSConnectionPool(host='open.bigmodel.cn', port=443): Read timed out. (read timeout=600)
+[glm_mutator] 警告: GLM 返回空响应 (attempt 1/3)
+[glm_mutator] 警告: GLM 返回空响应 (attempt 1/3)

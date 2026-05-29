@@ -1,0 +1,26 @@
+{
+  "skill_id": "tls_8013476764_cycle_v0000",
+  "crossing_id": "8013476764",
+  "skill_type": "cycle",
+  "version": 0,
+  "parent_skill_ids": [],
+  "code_hash": "7b8ca2f707acd44217486b6ea12a0383ba0716bf3d1f831c8c0729532229cd5d",
+  "prompt_hash": "90802092430e7dce1809259ffbd6e358357479a61787fea16aedcd6ed91502fd",
+  "data_split_hash": "",
+  "sumo_scenario_hash": "e456d119f812a3ce3112bcca2128f0e779155d3c2db44857fd91a8ec56dee268",
+  "glm_model": "seed",
+  "created_at": "2026-05-29T02:19:50.378095+00:00",
+  "frozen": true,
+  "online_learning": false,
+  "exploration": false,
+  "constraints_profile": "default",
+  "metrics": {
+    "replay_score": 0.0,
+    "sumo_score": 0.0,
+    "safety_violations": 0,
+    "phase_starvation_count": 0,
+    "mean_waiting": 0.0,
+    "mean_queue": 0.0,
+    "throughput": 0.0
+  }
+}

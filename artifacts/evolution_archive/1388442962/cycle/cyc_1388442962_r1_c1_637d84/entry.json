@@ -1,0 +1,140 @@
+{
+  "candidate_id": "cyc_1388442962_r1_c1_637d84",
+  "crossing_id": "1388442962",
+  "skill_type": "cycle",
+  "parent_ids": [],
+  "code": "import math\n\ndef plan(obs):\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    if not green_phases:\n        return CyclePlan(cycle_length=80.0, green_times={}, phase_order=[])\n    \n    # 参数配置\n    min_green = 10.0\n    max_green = 60.0\n    min_cycle = 40.0\n    max_cycle = 180.0\n    base_cycle = 80.0\n    yellow_time = 3.0\n    all_red_time = 2.0\n    \n    # 计算每个相位的压力值\n    phase_pressures = {}\n    total_queue = 0.0\n    total_waiting_time = 0.0\n    \n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            phase_pressures[gp] = 0.0\n            continue\n        \n        queue = phase_obs.queue\n        waiting_time = phase_obs.waiting_time\n        predicted_arrival = phase_obs.predicted_arrival\n        saturation_flow = phase_obs.saturation_flow\n        \n        total_queue += queue\n        total_waiting_time += waiting_time\n        \n        # 计算基础压力值（排队车辆 + 等待时间 + 预测到达车辆）\n        pressure = queue * 1.0 + waiting_time * 0.2 + predicted_arrival * 0.5\n        \n        # 考虑饱和流率调整（高饱和流率说明通行能力强，可适当降低压力）\n        if saturation_flow > 0:\n            pressure = pressure * (1.0 / (1.0 + saturation_flow * 0.01))\n        \n        phase_pressures[gp] = pressure\n    \n    # 根据总排队长度动态调整周期长度\n    if total_queue < 5:\n        cycle_length = base_cycle * 0.7\n    elif total_queue > 50:\n        cycle_length = base_cycle * 1.3\n    else:\n        cycle_length = base_cycle * (0.7 + 0.6 * (total_queue - 5) / 45.0)\n    \n    # 考虑平均等待时间进一步调整周期\n    if len(green_phases) > 0:\n        avg_waiting = total_waiting_time / len(green_phases)\n        if avg_waiting > 60:\n            cycle_length *= 1.2\n        elif avg_waiting > 30:\n            cycle_length *= 1.1\n    \n    # 考虑下游溢出风险缩短周期\n    if hasattr(ego, 'downstream_spillback_risk') and ego.downstream_spillback_risk > 0.5:\n        cycle_length *= max(0.8, 1.0 - ego.downstream_spillback_risk * 0.2)\n    \n    # 考虑上游释放压力延长周期\n    if hasattr(ego, 'upstream_release_pressure') and ego.upstream_release_pressure > 0.5:\n        cycle_length *= min(1.2, 1.0 + ego.upstream_release_pressure * 0.1)\n    \n    # 约束周期长度\n    cycle_length = max(min_cycle, min(max_cycle, cycle_length))\n    \n    # 减去黄灯和全红时间（假设每个相位之间有黄灯+全红）\n    total_lost_time = (yellow_time + all_red_time) * len(green_phases)\n    available_green_time = max(min_cycle, cycle_length - total_lost_time)\n    \n    # 调整压力值，确保所有相位都能获得最小绿灯时间\n    total_pressure = sum(phase_pressures.values())\n    if total_pressure <= 0:\n        # 如果没有压力，均匀分配\n        green_times = {gp: available_green_time / len(green_phases) for gp in green_phases}\n    else:\n        # 按压力比例分配绿灯时间\n        min_pressure = min(phase_pressures.values())\n        shifted_pressures = {gp: max(p - min_pressure + 1.0, 0.1) for gp, p in phase_pressures.items()}\n        total_shifted = sum(shifted_pressures.values())\n        \n        green_times = {}\n        for gp in green_phases:\n            allocated = available_green_time * (shifted_pressures[gp] / total_shifted)\n            green_times[gp] = allocated\n    \n    # 应用绿灯时间约束\n    for gp in green_phases:\n        green_times[gp] = max(min_green, min(max_green, green_times[gp]))\n    \n    # 重新计算实际周期长度（绿灯时间总和 + 损失时间）\n    actual_cycle_length = sum(green_times.values()) + total_lost_time\n    actual_cycle_length = max(min_cycle, min(max_cycle, actual_cycle_length))\n    \n    # 如果实际周期超出约束，按比例调整绿灯时间\n    if actual_cycle_length != sum(green_times.values()) + total_lost_time:\n        scale_factor = (actual_cycle_length - total_lost_time) / sum(green_times.values())\n        green_times = {gp: max(min_green, min(max_green, green_times[gp] * scale_factor)) for gp in green_phases}\n        actual_cycle_length = sum(green_times.values()) + total_lost_time\n    \n    return CyclePlan(\n        cycle_length=actual_cycle_length,\n        green_times=green_times,\n        phase_order=green_phases,\n        offset_target=None\n    )",
+  "code_hash": "f2423b377150fab4600ad3d46123a572ba2f03022108db922c4ad366e625a534",
+  "prompt": "# 路口特征\n路口 ID: 1388442962\n相位数量: 4\n最小绿灯: 10.0s\n最大绿灯: 60.0s\n最小周期: 40.0s\n最大周期: 180.0s\n黄灯时间: 3.0s\n全红时间: 2.0s\n最大延长: 5.0s\n最大缩短: 5.0s\n强制相位: 无\n\n\n# 约束条件\n  min_green: 10.0\n  max_green: 60.0\n  min_cycle: 40.0\n  max_cycle: 180.0\n  yellow_time: 3.0\n  all_red_time: 2.0\n  max_extend: 5.0\n  max_shorten: 5.0\n  force_phase_ids: set()\n\n# 父代算法代码\n```python\n\"\"\"Cycle planner seed for intersection 1388442962.\"\"\"\nfrom collections import deque\nfrom typing import Dict, List, Optional\nfrom signalclaw.core.state import NetworkObservation, CyclePlan\n\n_min_green = 10.0\n_max_green = 60.0\n_base_cycle = 80.0\n_history_window = 5\n\n_pressure_history: Dict[int, deque] = {}\n_last_green_time: Dict[int, float] = {}\n\n\ndef _get_history(phase_id: int) -> deque:\n    if phase_id not in _pressure_history:\n        _pressure_history[phase_id] = deque(maxlen=_history_window)\n    return _pressure_history[phase_id]\n\n\ndef plan(obs: \"NetworkObservation\") -> \"CyclePlan\":\n    ego = obs.ego\n    green_phases = sorted(ego.phases.keys())\n    if not green_phases:\n        return CyclePlan(cycle_length=_base_cycle, green_times={}, phase_order=[])\n\n    scores = {}\n    for gp in green_phases:\n        phase_obs = ego.phases.get(gp)\n        if phase_obs is None:\n            scores[gp] = 0.0\n            continue\n        local_pressure = phase_obs.queue\n        downstream_total = sum(ego.downstream_queue.values()) if ego.downstream_queue else 0.0\n        n_downstream = max(len(ego.downstream_queue), 1)\n        avg_downstream = downstream_total / n_downstream\n        spillback_risk = max(0, avg_downstream - 5.0) * 2.0\n        arrival_prediction = phase_obs.waiting_time * 0.3\n        last_served = _last_green_time.get(gp, 0)\n        hunger_time = obs.timestamp - last_served\n        hunger_bonus = min(hunger_time * 0.5, 15.0)\n        score = (\n            1.0 * local_pressure\n            + 0.4 * arrival_prediction\n            - 0.8 * spillback_risk\n            + 0.6 * hunger_bonus\n        )\n        scores[gp] = score\n        _get_history",
+  "prompt_hash": "60c2d16c84a3fcee756d8b59106c11f13257e25307c38bd904195a7180ee494a",
+  "glm_model": "glm-5.1",
+  "generation": 1,
+  "static_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [],
+    "has_correct_interface": true,
+    "complexity_score": 21.6
+  },
+  "prior_check": {
+    "passed": true,
+    "violations": [],
+    "warnings": [],
+    "score": 1.0
+  },
+  "replay_report": {
+    "candidate_id": "cyc_1388442962_r1_c1_637d84",
+    "crossing_id": "1388442962",
+    "skill_type": "cycle",
+    "passed": true,
+    "violations": [],
+    "score": 0.9516,
+    "failure_cases": [
+      {
+        "scenario": "normal",
+        "violation": "prior_warning",
+        "detail": "[normal][prior] phase 0 green_time=13.2s < 先验下限 15s"
+      },
+      {
+        "scenario": "normal",
+        "violation": "prior_warning",
+        "detail": "[normal][prior] phase 2 green_time=11.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "normal",
+        "violation": "prior_warning",
+        "detail": "[normal][prior] phase 3 green_time=14.1s < 先验下限 15s"
+      },
+      {
+        "scenario": "peak_hour",
+        "violation": "prior_warning",
+        "detail": "[peak_hour][prior] phase 2 green_time=11.5s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 0 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 1 green_time=10.6s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 2 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "off_peak",
+        "violation": "prior_warning",
+        "detail": "[off_peak][prior] phase 3 green_time=10.2s < 先验下限 15s"
+      },
+      {
+        "scenario": "extreme_imbalance",
+        "violation": "prior_warning",
+        "detail": "[extreme_imbalance][prior] phase 1 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "extreme_imbalance",
+        "violation": "prior_warning",
+        "detail": "[extreme_imbalance][prior] phase 2 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "extreme_imbalance",
+        "violation": "prior_warning",
+        "detail": "[extreme_imbalance][prior] phase 3 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "downstream_congested",
+        "violation": "prior_warning",
+        "detail": "[downstream_congested][prior] phase 2 green_time=14.6s < 先验下限 15s"
+      },
+      {
+        "scenario": "six_phase",
+        "violation": "prior_warning",
+        "detail": "[six_phase][prior] phase 0 green_time=10.2s < 先验下限 15s"
+      },
+      {
+        "scenario": "six_phase",
+        "violation": "prior_warning",
+        "detail": "[six_phase][prior] phase 1 green_time=11.8s < 先验下限 15s"
+      },
+      {
+        "scenario": "six_phase",
+        "violation": "prior_warning",
+        "detail": "[six_phase][prior] phase 2 green_time=13.3s < 先验下限 15s"
+      },
+      {
+        "scenario": "six_phase",
+        "violation": "prior_warning",
+        "detail": "[six_phase][prior] phase 3 green_time=14.8s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 0 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 1 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 2 green_time=10.0s < 先验下限 15s"
+      },
+      {
+        "scenario": "empty_intersection",
+        "violation": "prior_warning",
+        "detail": "[empty_intersection][prior] phase 3 green_time=10.0s < 先验下限 15s"
+      }
+    ],
+    "test_cases_run": 8
+  },
+  "sumo_report": null,
+  "selected": false,
+  "rejection_reason": "",
+  "created_at": "2026-05-29T09:38:57.112541+00:00"
+}

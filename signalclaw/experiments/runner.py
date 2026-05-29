@@ -680,7 +680,10 @@ def main():
             print(f"  [SignalClaw-Seed] Failed: {e}")
 
     # --- 运行 SignalClaw-Evolved（如果 cohort 存在）---
-    evolved_cohort_path = os.path.join(project_dir, "artifacts", "skills", "cohorts", "evolved_cohort.json")
+    # 优先查找 evolution_archive 中的 evolved_cohort，其次查找 skills/cohorts
+    evolved_cohort_path = os.path.join(project_dir, "artifacts", "evolution_archive", "evolved_cohort.json")
+    if not os.path.exists(evolved_cohort_path):
+        evolved_cohort_path = os.path.join(project_dir, "artifacts", "skills", "cohorts", "evolved_cohort.json")
     if os.path.exists(evolved_cohort_path):
         try:
             runner.run_signalclaw_cohort(
