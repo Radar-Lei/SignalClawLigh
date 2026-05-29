@@ -1,0 +1,41 @@
+{
+  "FixedTime": {
+    "method": "FixedTime",
+    "avg_queue": 776.0944444444444,
+    "max_queue": 1421.0,
+    "avg_waiting_time": 99.5313213408467,
+    "max_waiting_time": 512.5773732119636,
+    "avg_delay": 76539.58611111112,
+    "total_throughput": 815,
+    "total_stops": 83650,
+    "avg_travel_time": 372.8166602291747,
+    "completed_vehicles": 7767,
+    "steps": 360
+  },
+  "MaxPressure": {
+    "method": "MaxPressure",
+    "avg_queue": 705.3194444444445,
+    "max_queue": 1162.0,
+    "avg_waiting_time": 108.86734575928335,
+    "max_waiting_time": 567.3888166449935,
+    "avg_delay": 83718.98888888888,
+    "total_throughput": 828,
+    "total_stops": 76004,
+    "avg_travel_time": 359.5034991729228,
+    "completed_vehicles": 7859,
+    "steps": 360
+  },
+  "SignalClaw": {
+    "method": "SignalClaw",
+    "avg_queue": 529.1305555555556,
+    "max_queue": 930.0,
+    "avg_waiting_time": 40.21664138130328,
+    "max_waiting_time": 168.27568270481143,
+    "avg_delay": 30926.597222222223,
+    "total_throughput": 799,
+    "total_stops": 56988,
+    "avg_travel_time": 337.16932440657337,
+    "completed_vehicles": 8215,
+    "steps": 360
+  }
+}
