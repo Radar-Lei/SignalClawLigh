@@ -46,7 +46,8 @@ class SkillSelector:
             "code_complexity": 0.05,
         }
 
-        # SUMO 评估器引用（用于按需触发 seed baseline 评估）
+        # SUMO 评估器引用（用于按需触发 seed baseline 评估和 paired evaluation）
+        # 可以是 SealedSUMOEvaluator（推荐）或普通 SUMOEvaluator
         self._sumo_evaluator = sumo_evaluator
 
     # ------------------------------------------------------------------
@@ -272,14 +273,17 @@ class SkillSelector:
         self,
         candidates: List[ArchiveEntry],
         incumbent: Optional[ArchiveEntry] = None,
+        cohort=None,
+        crossing_id: Optional[str] = None,
     ) -> Optional[ArchiveEntry]:
         """选择可部署的 champion 候选。
 
         核心规则：
         1. 候选必须有真实的 sumo_report（非空、非零）
-        2. 候选必须通过 paired non-degradation gate（相对 incumbent 不退化）
-        3. 如果没有候选通过，返回 incumbent（不是 archive best）
-        4. incumbent 为 None 时使用 seed baseline 作为对照
+        2. 如果没有 sumo_report 但有 SealedSUMOEvaluator，自动触发 paired evaluation
+        3. 候选必须通过 paired non-degradation gate（相对 incumbent 不退化）
+        4. 如果没有候选通过，返回 incumbent（不是 archive best）
+        5. incumbent 为 None 时使用 seed baseline 作为对照
 
         Parameters
         ----------
@@ -289,6 +293,10 @@ class SkillSelector:
             当前 champion（即 seed entry 或上一代 champion）。
             用于 non-degradation gate 对照。
             如果为 None，则仅检查绝对门槛。
+        cohort : SkillCohort, optional
+            当前 skill 集合，用于触发 paired evaluation。
+        crossing_id : str, optional
+            目标路口 ID，用于触发 paired evaluation。
 
         Returns
         -------
@@ -309,6 +317,12 @@ class SkillSelector:
         inc_report = None
         if incumbent and incumbent.sumo_report:
             inc_report = incumbent.sumo_report
+
+        # 尝试为缺少 sumo_report 的候选触发 paired evaluation
+        if self._sumo_evaluator is not None and cohort is not None and crossing_id is not None:
+            self._ensure_paired_evaluations(
+                archive_valid, incumbent, cohort, crossing_id,
+            )
 
         # 硬门槛过滤
         passed = []
@@ -367,6 +381,74 @@ class SkillSelector:
     # ------------------------------------------------------------------
     # Champion hard gates & soft scoring (for select_deployable_champion)
     # ------------------------------------------------------------------
+
+    def _ensure_paired_evaluations(
+        self,
+        candidates: List[ArchiveEntry],
+        incumbent: Optional[ArchiveEntry],
+        cohort,
+        crossing_id: str,
+    ) -> None:
+        """为缺少真实 sumo_report 的候选触发 SealedSUMOEvaluator paired evaluation。
+
+        如果 evaluator 是 SealedSUMOEvaluator，使用 paired_evaluate。
+        如果是普通 SUMOEvaluator，使用 evaluate_multi_seed 作为 fallback。
+
+        结果会写回到 candidate entry 的 sumo_report 中。
+        """
+        from signalclaw.evolution.evaluator_sumo import SealedSUMOEvaluator
+
+        is_sealed = isinstance(self._sumo_evaluator, SealedSUMOEvaluator)
+
+        for c in candidates:
+            # 跳过已有真实报告的
+            if c.sumo_report and self._is_real_sumo_report(c):
+                continue
+
+            if not c.code:
+                continue
+
+            logger.info(
+                "候选 %s 缺少 SUMO 报告，触发 %s 评估...",
+                c.candidate_id,
+                "paired sealed" if is_sealed else "multi-seed",
+            )
+
+            try:
+                if is_sealed and incumbent and incumbent.code:
+                    # 使用 paired evaluation（candidate vs incumbent）
+                    paired_report = self._sumo_evaluator.paired_evaluate(
+                        incumbent_code=incumbent.code,
+                        candidate_code=c.code,
+                        skill_type=c.skill_type,
+                        crossing_id=crossing_id,
+                        cohort=cohort,
+                    )
+
+                    # 将 paired report 的 candidate 部分写入 entry
+                    c.set_sumo_report_from_paired(paired_report)
+
+                    if not paired_report.passed:
+                        c.paired_eval_passed = False
+                        c.deployment_rejection_reason = paired_report.rejection_reason
+                    else:
+                        c.paired_eval_passed = True
+
+                elif self._sumo_evaluator is not None:
+                    # Fallback：使用普通 multi-seed 评估
+                    sumo_report = self._sumo_evaluator.evaluate_multi_seed(
+                        candidate_code=c.code,
+                        skill_type=c.skill_type,
+                        crossing_id=crossing_id,
+                        cohort=cohort,
+                    )
+                    c.set_sumo_report(sumo_report)
+
+            except Exception as e:
+                logger.warning(
+                    "候选 %s SUMO 评估触发失败: %s",
+                    c.candidate_id, e,
+                )
 
     def _passes_hard_gates(
         self,

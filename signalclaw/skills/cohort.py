@@ -23,7 +23,10 @@ class SkillCohort:
     skills: Dict[str, Dict[str, str]]  # crossing_id -> {"cycle": path, "phase": path}
     frozen: bool = False
     glm_used_online: bool = False
+    exploration: bool = False
     created_by: str = "manual"
+    source: str = "manual"  # "sealed_sumo_champion" | "archive_only" | "seed_fallback" | "manual"
+    all_skills_accepted_for_deployment: bool = False
 
     # 缓存：避免重复加载
     _cache: Dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -34,7 +37,10 @@ class SkillCohort:
             "skills": self.skills,
             "frozen": self.frozen,
             "glm_used_online": self.glm_used_online,
+            "exploration": self.exploration,
             "created_by": self.created_by,
+            "source": self.source,
+            "all_skills_accepted_for_deployment": self.all_skills_accepted_for_deployment,
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -47,7 +53,10 @@ class SkillCohort:
             skills=d["skills"],
             frozen=d.get("frozen", False),
             glm_used_online=d.get("glm_used_online", False),
+            exploration=d.get("exploration", False),
             created_by=d.get("created_by", "manual"),
+            source=d.get("source", "manual"),
+            all_skills_accepted_for_deployment=d.get("all_skills_accepted_for_deployment", False),
         )
 
     @classmethod

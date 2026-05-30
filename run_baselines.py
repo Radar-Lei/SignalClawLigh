@@ -200,11 +200,11 @@ def main():
     output_path = os.path.join(PROJECT_DIR, "results", "baseline_comparison.json")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # 只保存关键指标
+    # 保存关键指标 + controller_stats（如果有）
     output = {}
     for name in method_names:
         s = summaries.get(name, {})
-        output[name] = {
+        entry = {
             "method": name,
             "avg_queue": s.get("avg_queue"),
             "avg_waiting_time": s.get("avg_waiting_time"),
@@ -212,6 +212,11 @@ def main():
             "avg_travel_time": s.get("avg_travel_time"),
             "total_stops": s.get("total_stops"),
         }
+        # 附加 OnlineController 双 Skill 闭环统计
+        m = runner.results.get(name)
+        if m is not None and hasattr(m, 'controller_stats') and m.controller_stats is not None:
+            entry["controller_stats"] = m.controller_stats
+        output[name] = entry
 
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)

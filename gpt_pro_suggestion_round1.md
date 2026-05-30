@@ -1,457 +1,608 @@
-对，**你这个要求是必须成立的**：
-进化系统不能只是“生成了一个新 Skill”，而应该是：
+我看了当前 `main` 分支。整体判断是：
 
-> **只有通过严格 sealed evaluation 并且统计上不退化的候选，才允许替换当前 champion。否则就保留原 champion。**
+**仓库已经从“手写 SignalClaw 原型”升级到了“有 artifact、evolution、selector、SUMO evaluator、OnlineController 的完整框架雏形”。但它还没有真正达到“可相信的单调进化系统”。下一步最重要的不是继续让 GLM 多生成几个 Skill，而是把 3 个闭环修严：deployable champion 门槛、真实双 Skill 在线执行、sealed SUMO 评估。**
 
-所以“候选可以变差”，但**champion 不能越进化越差**。现在的问题不是“GLM 没用”，而是进化管线还没有真正实现 **monotonic champion update**。当前结果里，SignalClaw-Evolved 的 `avg_queue=806.01`、`avg_waiting_time=163.61`、`completed_vehicles=7098`，确实明显差于 SignalClaw-Seed 的 `avg_queue=747.61`、`avg_waiting_time=126.89`、`completed_vehicles=7508`；这个不能被包装成成功。([GitHub][1])
+---
 
-## 1. 先说 MaxPressure：你说得对，它应该是强 baseline
+## 1. 目前仓库已经更新得比较多，这是好事
 
-MaxPressure 大概率应该比 FixedTime 好，至少在拥堵、需求变化、不均衡流量下，它应该在**队列、吞吐、旅行时间**这些主指标上压过普通固定配时。理论上，MaxPressure 的核心优势是基于本地上游/下游队列压力做自适应控制，并有 maximum stability 这类性质；但实际效果会被相位约束、固定周期、切换损失、turning ratio、下游容量建模影响。([科学直达][2])
+现在根目录已经有 `artifacts/`、`signalclaw/`、`results/`、`sumo_scenarios/` 等目录；`signalclaw` 下也已经拆出了 `core`、`evolution`、`execution`、`experiments`、`network`、`scenario`、`skills` 等模块，说明项目结构已经明显比之前完整。([GitHub][1])
 
-你现在仓库里的情况很关键：`max_pressure.py` 已经写了四个变体，包括 `MaxPressureCyclicAllocation`、`MaxPressureQueueOnly`、`MaxPressureCanonical`、`MaxPressureCyclicMovement`，并且 `MaxPressureCanonical` 的注释说它是“每个 decision interval 选择最高 pressure phase，满足 min_green 后才切换”的 classic 版本；但文件最后仍然把 `MaxPressureSkill = MaxPressureCyclicAllocation` 作为 backward-compatible alias。([GitHub][3]) 也就是说，当前默认实验很可能跑的还是**固定相序、按压力分配绿灯的弱化版 MaxPressure**，不是你真正想拿来做强 baseline 的 canonical MaxPressure。runner 默认方法里也确实用的是 `MaxPressureSkill(decision_interval=...)`。([GitHub][4])
+尤其是 `signalclaw/evolution` 现在不再是空壳，已经有 `glm_mutator.py`、`ast_sandbox.py`、`behavior_contracts.py`、`dsl_compiler.py`、`evaluator_replay.py`、`evaluator_sumo.py`、`per_intersection.py`、`selector.py`、`run_evolution.py` 等文件。也就是说，“离线进化 Skill”的骨架已经搭出来了。([GitHub][2])
 
-所以我建议马上把 baseline 分成这几条线跑清楚：
+`signalclaw/execution` 里也已经有 `cycle_manager.py`、`phase_manager.py`、`online_controller.py`、`safety_layer.py`、`stats.py`；这说明你已经开始把“周期 Skill”和“相位 Skill”的在线执行层独立出来。([GitHub][3])
 
-```text
-FixedTime
-MaxPressure-CyclicAllocation    # 当前默认，保留作历史对照
-MaxPressure-QueueOnly           # 排查 downstream pressure 是否制造噪声
-MaxPressure-Canonical           # 真正强 baseline
-MaxPressure-CyclicMovement      # 固定相序 + movement-level pressure
-SignalClaw-Seed
-SignalClaw-Evolved
-```
+`signalclaw/skills` 里现在也有 `artifact.py`、`cohort.py`、`loader.py`、`max_pressure.py`、`registry.py`、`signalclaw_skill.py`，说明 frozen skill artifact 和 cohort 加载这条线已经开始落地。([GitHub][4])
 
-验收标准应该写死：
+所以当前不是“方向错了”。方向是对的。现在的问题是：**几个关键地方还没有真正闭环，导致 evolved 结果可能被错误地当成 champion。**
 
-```text
-如果 MaxPressure-Canonical 在 avg_queue / completed_vehicles / avg_travel_time 上
-不能稳定好于 FixedTime，
-优先怀疑：
-1. phase ↔ movement mapping 错；
-2. downstream queue 不是 movement-specific；
-3. min_green / yellow / all-red / switching loss 没处理好；
-4. 指标口径有问题；
-5. FixedTime 本身是 SUMO 网络里非常强的预设配时。
-```
+---
 
-当前结果里，MaxPressure 其实不是全面输 FixedTime：`avg_queue` 从 776.09 降到 705.32，`completed_vehicles` 从 7767 到 7859，`avg_travel_time` 从 372.82 到 359.50；但 `avg_waiting_time` 从 99.53 升到 108.87。([GitHub][1]) 这个现象更像“实现/执行方式/指标口径混合问题”，不是 MaxPressure 理论不行。
+## 2. 当前最严重的问题：archive candidate 仍然可能被当成 evolved champion
 
-## 2. 现在 Evolved 变差的根因：不是“进化”，是“没有 champion 门槛”
+你的 `selector.py` 已经写出了正确思想：`select_deployable_champion()` 要求候选有真实 `sumo_report`，并且通过 paired non-degradation gate；如果没有候选通过，就应该保留 incumbent。代码里也已经有硬门槛，例如必须有 SUMO 报告、总步数不能为 0、吞吐不得低于 incumbent 的 99%、等待和排队不能超过 103%、安全违规和相位饥饿必须为 0 等。([GitHub][5])
 
-现在要把“candidate”和“champion”严格分开。
+但是 `per_intersection.py` 里仍然存在一个危险 fallback：它会先选 `archive_best`，再选 `champion`，最后返回 `champion if champion is not None else archive_best`。这意味着：**如果没有真正 deployable champion，系统仍可能退回 archive 里 replay/AST 看起来最好的候选。** 这会破坏你最想要的性质：候选可以变差，但 champion 不能越进化越差。([GitHub][6])
 
-```text
-candidate:
-  GLM 生成出来的东西。
-  可以很差，可以失败，可以进入 archive 供分析。
-
-champion:
-  只有真实 SUMO sealed evaluation 通过、
-  并且相对 seed / incumbent 不退化，
-  才能替换线上/实验 cohort。
-```
-
-当前 `selector.py` 的文件注释已经写了“champion candidate 必须有真实 sumo_report、必须和 seed baseline 比较、必须满足硬门槛”，这方向是对的；但它的 `select()` 逻辑仍然写着如果没有 champion，就退回 archive 级候选。([GitHub][5]) 这个 fallback 对“研究 archive”可以，但对“deployable evolved cohort”不行。**没有 champion 时，应该返回 seed/incumbent，而不是返回 archive best。**
-
-更关键的是，`run_evolution.py` 里没有找到 `SUMOEvaluator` 或 `sumo_evaluator`，实际初始化的是 `selector = SkillSelector()`，然后只创建了 `ReplayEvaluator` 并传给 `PerIntersectionEvolver`。([GitHub][6]) 这说明当前进化主路径虽然加载了 scenario catalog，但没有真正把 SUMO 闭环评估作为 candidate 替换 champion 的硬裁判。
-
-所以现在的 Evolved 变差，不奇怪。它本质上是：
-
-```text
-GLM candidate
-  -> AST / replay / prior
-  -> selector fallback
-  -> evolved cohort
-```
-
-而不是：
-
-```text
-GLM candidate
-  -> AST / behavior tests
-  -> replay safety
-  -> micro-SUMO
-  -> full SUMO sealed paired evaluation
-  -> non-degradation gate
-  -> champion update
-```
-
-## 3. M.E.T.A. Optimization 应该这样定义
-
-我建议你把 **META Optimization** 明确定义成四层，写进项目文档和代码模块名里。
-
-```text
-M = Measurement
-E = Evolution
-T = Tournament
-A = Archive / Acceptance
-```
-
-### M：Measurement，先把评价函数修成可信的
-
-进化想变好，第一步不是调 prompt，而是修指标。现在 runner 每 10 步采样，`throughput` 用的是当步 `getArrivedIDList()`，`stops` 还是 `int(total_queue * 0.3)` proxy，这会导致 throughput、completed、stops 口径不一致。([GitHub][4])
-
-必须改成：
-
-```text
-completed_vehicles:
-  SUMO tripinfo / arrived vehicle count
-
-throughput_per_hour:
-  completed_vehicles / simulated_hours
-
-avg_travel_time:
-  completed vehicles 的真实 trip duration
-
-avg_waiting_time:
-  tripinfo waitingTime，或明确声明 lane-level waiting sample
-
-avg_queue:
-  每 step、每 lane halting number 的时间平均
-
-total_stops:
-  优先 SUMO tripinfo stops；
-  不要用 queue * 0.3 作为最终论文指标
-```
-
-没有 Measurement integrity，META 会优化错目标。
-
-### E：Evolution，LLM 只负责提案，不负责裁判
-
-FunSearch 和 AlphaEvolve 的共同点不是“相信大模型”，而是**大模型生成候选程序，自动 evaluator 做裁判，进化框架保留高分候选**。FunSearch 让候选以程序形式表达，从而可以自动运行和评估；AlphaEvolve 也是把 LLM 的代码生成能力和自动 evaluator 结合，用进化框架改进候选。([Google DeepMind][7])
-
-在 SignalClaw 里，LLM 的职责应该是：
-
-```text
-1. 生成新的评分公式结构；
-2. 增删 feature；
-3. 根据失败案例修 patch；
-4. 总结为什么某类场景失败；
-5. 输出 DSL / patch，而不是随意输出整文件 Python。
-```
-
-非 LLM optimizer 负责：
-
-```text
-1. 调 w_queue / w_wait / w_downstream / w_hunger 等连续参数；
-2. 用 grid search / CMA-ES / Bayesian optimization 做小维度调参；
-3. 用 Pareto selector 选候选；
-4. 用 SUMO sealed evaluator 做最终裁判。
-```
-
-你之前材料里也已经把方向定得很清楚：离线进化应是“LLM 代码进化 + 自动评估器 + 多目标选择 + 参数优化”，候选要过静态检查、历史 SQL 回放、SUMO 批量仿真、多目标排序和归档。
-
-### T：Tournament，用成对场景锦标赛替代单次分数
-
-不能让一个候选因为单个 run 运气好就替换 seed。要做 paired tournament：
-
-```text
-同一个 traffic_input_hash
-同一个 route/demand seed
-同一个 detector_noise seed
-同一个 incident seed
-同一个 time window
-
-Seed / Incumbent 跑一遍
-Candidate 跑一遍
-比较 delta
-```
-
-每个 candidate 至少跑：
-
-```text
-micro-SUMO:
-  1 个 ego intersection + one-hop neighbors
-  8~20 个短场景
-
-full-SUMO:
-  全网或 corridor
-  5 个随机 seed
-  peak / offpeak / high_demand / low_demand / incident
-```
-
-然后用硬门槛：
-
-```text
-candidate.completed_vehicles >= incumbent.completed_vehicles * 0.99
-candidate.avg_waiting_time <= incumbent.avg_waiting_time * 1.03
-candidate.avg_queue <= incumbent.avg_queue * 1.03
-candidate.safety_violations == 0
-candidate.phase_starvation == 0
-candidate.safety_clip_count 不显著增加
-```
-
-再用软目标排序：
-
-```text
-J =
-  1.0 * normalized_waiting
-+ 1.0 * normalized_queue
-+ 0.6 * normalized_travel_time
-- 0.8 * normalized_completed_vehicles
-+ 2.0 * safety_penalty
-+ 1.5 * spillback_penalty
-+ 1.0 * starvation_penalty
-+ 0.3 * cycle_volatility
-```
-
-**候选必须先过硬门槛，才进入软目标排序。**
-
-### A：Archive / Acceptance，保证 champion 单调不退化
-
-核心规则写成一句代码逻辑：
+这件事要马上改。建议把逻辑改成：
 
 ```python
-if passes_hard_gates(candidate, incumbent) and statistically_better(candidate, incumbent):
-    champion = candidate
-else:
-    champion = incumbent
+selected = selector.select_deployable_champion(
+    candidates,
+    incumbent=current_incumbent,
+)
+
+return selected
 ```
 
-这就是你要的“总得越来越好”。更精确地说，是：
+不要再 fallback 到 `archive_best`。`archive_best` 只能用于研究记录、prompt 反馈、失败案例总结，不能进入 deployable cohort。
 
-```text
-candidate population 可以波动；
-archive 可以保存坏候选；
-但 deployable champion / cohort 必须单调不退化。
-```
+同时，`run_evolution.py` 现在会构建并保存 `evolved_cohort.json`；保存 skill manifest 时也主要写了 `replay_score`，没有把 deployable champion 所需的 paired SUMO 证据作为硬字段写进去。([GitHub][7])
 
-不要再允许：
-
-```text
-没有真实 sumo_report -> 也能进 evolved_cohort
-sumo_score = 0/空 -> 也能当 champion
-replay_score 高 -> 直接替换 seed
-```
-
-你已有材料里也提到，下一版 selector 不应该只按 replay score 排，而要强制 `sumo_score` 是真实评估、completed 不下降、waiting/queue 不恶化、安全裁剪不增加。
-
-## 4. 现在为什么会“进化反而差”：我会重点抓 4 个 bug
-
-第一，**SUMO 闭环没有成为硬门槛**。上面说了，`run_evolution.py` 没看到 `SUMOEvaluator` 接入，selector 虽然写了 champion 概念，但主进化流程里实际只创建了 replay evaluator。([GitHub][6])
-
-第二，**runner 还没有真正执行 phase skill**。OnlineController 路径的注释明确说“只在检测到进入新的绿色相位时才干预，且只使用 `setPhaseDuration()` 控制绿色相位持续时间”。([GitHub][4]) 后面实际也是从 cycle plan 取 duration，然后 `traci.trafficlight.setPhaseDuration()`，并没有真正让 phase skill 做 hold/switch/extend/shorten 的闭环决策。([GitHub][4])
-
-第三，**observation mismatch**。runner 构造 `PhaseObservation` 时 `predicted_arrival=0.0`。([GitHub][4]) 如果 evolved skill 使用 `predicted_arrival`，那它在真实运行里等于用了一个恒为 0 的假特征。你材料里也明确指出：这会让 GLM 以为自己利用了预测到达，但真实闭环里这个信号不存在，目标和执行环境错位。
-
-第四，**净化/进化可能删掉 seed 的保护机制**。手写 seed 里通常有 hunger、smoothing、spillback guard 这类“土但稳”的保护。GLM 如果只是把代码写漂亮，或者根据 replay score 改公式，很容易削弱这些保护。你材料里建议把净化改成 regression-preserving purification：不得删除 hunger / smoothing / spillback guard，不得在 golden observations 上大幅改变动作。
-
-## 5. 你要的“保证越来越好”，应该分两条线实现
-
-### 线 A：单路口 skill 进化
-
-每个路口 `i` 有当前 incumbent：
-
-```text
-CycleSkill_i_current
-PhaseSkill_i_current
-```
-
-每轮进化：
-
-```text
-1. GLM 生成结构变体。
-2. DSL/schema/AST 过滤。
-3. 行为契约测试。
-4. Replay safety。
-5. 参数优化器调权重。
-6. micro-SUMO_i 评估。
-7. 与 current 做 paired comparison。
-8. 赢了才替换 current。
-```
-
-行为契约测试必须包含：
-
-```text
-队列增加，相位优先级不能下降太多；
-某相位长时间未服务，hunger bonus 必须上升；
-下游严重堵塞，对应放行相位不能继续大幅加绿；
-所有必须相位都要服务；
-同一 observation 多次调用输出必须一致；
-cycle jump 不能超过阈值。
-```
-
-你材料里已经把这层写得很对：不要让净化只是 “LLM rewrite -> AST pass -> 保存”，而应该走 schema、AST、unit tests、behavioral contract、replay safety、micro-SUMO、full-SUMO sealed 才能成为 champion。
-
-### 线 B：cohort 级进化
-
-交通信号不是每个路口单独最优就行。一个路口本地变好，可能把车推到下游，让 corridor 变差。所以要有 cohort selector：
-
-```text
-每个路口保留 top K 个候选：
-  A: 5 个
-  B: 5 个
-  C: 5 个
-  ...
-
-中心做 beam search / tournament：
-  组合成 cohort candidates
-  在 corridor T-SUMO 里跑
-  选全局不退化的 cohort
-```
-
-这和之前“中心做仲裁，不做每秒控制”的设计一致：中心负责 message broker、corridor context、skill cohort selector，而不是在线替每个路口每秒控灯。
-
-cohort 接受规则也要写死：
-
-```text
-global_completed 不下降；
-global_avg_waiting 不上升；
-global_avg_queue 不上升；
-任一路口 starvation 不增加；
-任一路口 safety override 不增加；
-下游 spillback 不增加；
-通过 corridor sealed scenarios。
-```
-
-## 6. 我建议你马上改的代码规则
-
-第一，把 selector 改成两个 API：
-
-```python
-select_archive_best(candidates) -> ArchiveEntry | None
-select_deployable_champion(candidates, incumbent) -> ArchiveEntry | incumbent
-```
-
-不要再让一个 `select()` 同时负责 archive 和 champion。现在的 fallback 会把 archive best 误当 evolved best。
-
-第二，在 manifest 里加硬字段：
+建议 manifest 立刻加这些字段：
 
 ```json
 {
   "is_archive_candidate": true,
   "is_deployable_champion": false,
   "has_real_sumo_report": false,
-  "incumbent_skill_id": "...",
   "paired_eval_passed": false,
   "accepted_for_deployment": false,
+  "incumbent_skill_id": "...",
   "rejection_reason": "missing_real_sumo_report"
 }
 ```
 
-第三，`evolved_cohort.json` 只能引用：
+然后规定：
 
 ```text
-accepted_for_deployment = true
-has_real_sumo_report = true
-paired_eval_passed = true
+evolved_cohort.json 只能引用 accepted_for_deployment=true 的 Skill。
+如果没有候选通过，就继续引用 seed/incumbent。
 ```
 
-否则继续用 seed/incumbent。
+这是下一步第一优先级。
 
-第四，把 `run_evolution.py` 改成真的创建并传入：
+---
+
+## 3. 当前结果已经暴露了这个问题
+
+`results/summary.json` 里，现在 `SignalClaw` 这个 legacy 版本表现最好：`avg_queue=531.63`、`avg_waiting_time=48.96`、`completed_vehicles=8013`。但 `SignalClaw-Seed` 明显差很多，`SignalClaw-Evolved` 又比 Seed 还差：`SignalClaw-Evolved` 的 `avg_queue=806.01`、`avg_waiting_time=163.61`、`completed_vehicles=7098`。([GitHub][8])
+
+这说明两个问题：
+
+第一，**新的 artifact/cohort 执行路径没有复现 legacy SignalClaw 的好结果**。所以你现在不能直接说“进化失败”，因为 seed artifact 本身就已经比 legacy SignalClaw 差很多。这里优先怀疑执行路径、phase skill 是否真的被调用、seed artifact 是否等价于 legacy code、runner 控制逻辑是否一致。
+
+第二，**当前 Evolved 不应该被称为成功 champion**。它可以被保存到 archive，作为失败候选分析；但它不应该进入 deployable cohort。
+
+所以短期结论要很清楚：
+
+```text
+SignalClaw legacy 有积极结果；
+SignalClaw-Seed artifact path 需要先对齐 legacy；
+SignalClaw-Evolved 当前不能算进化成功；
+下一步先修 champion gate 和 execution parity。
+```
+
+---
+
+## 4. 第二个严重问题：OnlineController 写得对，但 runner 没真正用完整双 Skill 闭环
+
+`OnlineController` 的设计是对的。它的文档里明确写了 no GLM、no exploration；在 cycle boundary 调 CycleSkill，在 phase decision 调 PhaseSkill。实际代码里 `_on_cycle_boundary()` 会调用 `cycle_skill.plan()`，`_on_phase_decision()` 会调用 `phase_skill.decide()`。([GitHub][9])
+
+但是 `runner.py` 里的 `_control_with_online_controller()` 没有真正调用这个完整闭环。它的注释和实现都显示：当前主要是在进入新绿灯相位时干预，只使用 `setPhaseDuration()` 设置当前相位持续时间；它会调用 cycle skill 生成 plan，然后从 plan 里取当前 phase 的 duration，再下发给 SUMO。([GitHub][10])
+
+也就是说，当前实验里的 `SignalClaw-Seed` / `SignalClaw-Evolved` 很可能并没有真正执行：
+
+```text
+cycle boundary -> CycleSkill
+phase decision -> PhaseSkill
+```
+
+而更像是：
+
+```text
+进入绿灯相位 -> 调 CycleSkill -> setPhaseDuration
+```
+
+这会直接削弱你的“双 Skill”架构。尤其如果 evolved phase skill 生成了很多 hold/switch/extend/shorten 逻辑，但 runner 根本没调用 `phase_skill.decide()`，那相位 Skill 的进化就没有进入闭环评估。
+
+下一步应该把 runner 改成真正调用 OnlineController，例如：
 
 ```python
-sumo_evaluator = SUMOEvaluator(...)
-selector = SkillSelector(sumo_evaluator=sumo_evaluator)
+for tls_id in tls_ids:
+    cmd = online_controller.step(
+        tls_id=tls_id,
+        sim_time=sim_time,
+        raw_sumo_state=...
+    )
 
-evolver = PerIntersectionEvolver(
-    ...
-    replay_evaluator=replay_evaluator,
-    sumo_evaluator=sumo_evaluator,
-    seed_cohort=cohort,
-    scenario_catalog=scenario_catalog,
-)
+    if cmd is not None:
+        traci_executor.apply_phase_command(tls_id, cmd)
 ```
 
-现在 `scenario_catalog_path` 虽然有参数和加载逻辑，但没有接入 `SUMOEvaluator`，这就会出现“看起来支持多场景，实际上没有用 SUMO 做 champion gate”的问题。([GitHub][6])
-
-第五，把当前 evolved cohort 先降级命名：
+然后 `PhaseCommand` 必须真实落到 TraCI：
 
 ```text
-archive_evolved_candidates_v001.json
+hold      -> 保持当前相位，并设置剩余 duration
+extend    -> 延长当前 phase duration
+shorten   -> 缩短当前 phase duration，但不能低于 min_green
+switch    -> 切到 next_phase_id，处理 yellow/all-red
 ```
 
-不要叫：
+验收标准也要写死：
 
 ```text
-deployable_evolved
-champion
-best
+cycle_plan_count > 0
+phase_decision_count > 0
+phase_hold_count / switch_count / extend_count / shorten_count 有真实记录
+safety_clip_count 有日志
+online_glm_calls = 0
 ```
 
-因为当前 sealed SUMO 结果已经显示它比 Seed 差。
+---
 
-## 7. MaxPressure 这边怎么做成“靠谱 baseline”
+## 5. 第三个严重问题：SUMO evaluator 还不是 deployable champion 的必需条件
 
-我建议短期改三件事。
+`evaluator_sumo.py` 已经存在，而且设计目标是 T-SUMO offline evaluator：替换目标路口的候选 Skill，其他路口保持原 cohort，然后跑多 seed 的离线仿真。([GitHub][11])
 
-第一，默认 baseline 不再用 alias：
+但 `run_evolution.py` 里 `_try_create_sumo_evaluator()` 是 graceful fallback：如果没有 scenario catalog 或相关依赖，就跳过 SUMO evaluator，只用 ReplayEvaluator。([GitHub][7])
+
+这个 fallback 对“开发调试”可以接受，但对“生成 deployable evolved cohort”不能接受。建议分成两个模式：
+
+```text
+archive mode:
+  可以没有 SUMO evaluator。
+  只保存 candidate 到 archive。
+  不写 deployable evolved_cohort。
+
+deployable mode:
+  必须有 SUMO evaluator。
+  必须有 scenario catalog。
+  必须有 paired candidate-vs-incumbent 结果。
+  没有候选通过就保持 seed/incumbent。
+```
+
+CLI 上可以加：
+
+```bash
+--archive-only
+--require-sumo-for-champion
+--write-deployable-cohort
+```
+
+默认建议：
+
+```text
+没有 SUMO sealed evaluation，就不能写 evolved_cohort.json。
+```
+
+---
+
+## 6. 第四个问题：`predicted_arrival` 仍然是 0，但进化 Skill 可能会依赖它
+
+`runner.py` 里现在 `DEFAULT_PREDICTED_ARRIVAL = 0.0`，并且注释里也写了 TODO：真实 predictor 还没有接入；`enable_prediction` 时也还是 placeholder。([GitHub][10])
+
+这很危险。因为 GLM 生成 Skill 时可能会写：
 
 ```python
-"MaxPressure": create_max_pressure("canonical", decision_interval=5.0)
+score = queue * 1.0 + predicted_arrival * 1.5 + waiting * 0.2
 ```
 
-不要再让 `MaxPressureSkill = MaxPressureCyclicAllocation` 偷偷作为默认强 baseline。`max_pressure.py` 现在已经有 factory，直接用 variant 名更清楚。([GitHub][3])
+但真实 runner 里 `predicted_arrival` 永远是 0。于是进化环境和执行环境不一致，候选在 replay/prompt 里看起来合理，SUMO 闭环里却退化。
 
-第二，修 movement mapping。当前 runner 能从 SUMO traffic light connections 里构造 `phase_incoming` 和 `phase_outgoing`。([GitHub][4]) 但 MaxPressure 真正需要的是：
+下一步要做 feature availability gate：
+
+```json
+{
+  "queue": true,
+  "waiting_time": true,
+  "downstream_queue": true,
+  "neighbor_pressure": true,
+  "predicted_arrival": false
+}
+```
+
+然后：
 
 ```text
-phase_id -> movements
-movement -> upstream lanes
-movement -> downstream lanes
-movement -> saturation flow
-movement -> turning ratio
+如果 predicted_arrival=false：
+  prompt 里禁止使用 predicted_arrival；
+  DSL compiler 不允许该 feature；
+  AST / behavior test 检查候选代码是否访问该字段；
+  访问则 reject。
 ```
 
-不是简单把所有 downstream queue 平均掉。否则 pressure 就会失真。
-
-第三，加入 switching loss aware 版本。很多 MaxPressure 论文/实践都会提醒：原始 MaxPressure 的非周期相位选择、频繁切换、忽略切换损失，会导致现实效果受损；cyclic MaxPressure 是为了工程可接受性，但可能比 original non-cyclic 弱。([科学直达][2]) 所以我们的 canonical baseline 不能粗暴每 5 秒乱切，要有：
+或者反过来，先把 prediction 接上：
 
 ```text
-min_green
-max_green
-yellow/all-red loss
-cooldown
-pressure hysteresis
-switch penalty
+SUMO short-horizon arrival predictor
+SQL prediction_record replay
+简单 travel-time shifted upstream release predictor
 ```
 
-最终 baseline 表应该这么报：
+在 prediction 没接好之前，不要让 GLM 用这个特征。
+
+---
+
+## 7. MaxPressure baseline 现在比之前好，但还要继续作为 sanity check
+
+`max_pressure.py` 现在已经有五个变体：`CyclicAllocation`、`QueueOnly`、`Canonical`、`CyclicMovement`、`SwitchLossAware`。默认 alias 也已经改成 `MaxPressureCanonical`，这是正确方向。([GitHub][12])
+
+当前 summary 里 MaxPressure 相比 FixedTime，`avg_queue`、`max_queue`、`avg_travel_time`、`completed_vehicles` 更好，但 `avg_waiting_time` 更差。([GitHub][8]) 这不是致命问题，但它应该继续作为 sanity check。
+
+下一步建议固定跑这几个 baseline：
 
 ```text
 FixedTime
 MaxPressure-CyclicAllocation
+MaxPressure-QueueOnly
 MaxPressure-Canonical
 MaxPressure-SwitchLossAware
-SOTL
-SignalClaw-Seed
-SignalClaw-Evolved-Champion
+SignalClaw legacy
+SignalClaw-Seed artifact
+SignalClaw-Evolved champion
 ```
 
-如果 `MaxPressure-Canonical` 还不能大体压过 FixedTime，那就先别急着吹 SignalClaw，先查 phase mapping / pressure / metrics。MaxPressure 是我们的 sanity check。
-
-## 8. 最终路线：不要追求每个 candidate 都变好，要保证 champion 越来越好
-
-可以把下一阶段目标改成：
+这里的关键不是证明 MaxPressure 一定最强，而是用它检查：
 
 ```text
-v1.3 META Optimization: Monotonic Champion Evolution
+phase mapping 是否正确
+movement downstream queue 是否正确
+runner 是否真的调用 decide()
+metrics 是否一致
+yellow/all-red/switch loss 是否处理合理
+```
+
+如果 `MaxPressure-Canonical` 在多 seed 下明显跑不过 FixedTime，就先别急着优化 GLM，先查 SUMO phase/movement mapping 和 runner 执行逻辑。
+
+---
+
+## 8. 第五个问题：`SignalClaw` legacy 和 `SignalClaw-Seed` artifact 差距太大，必须先对齐
+
+当前结果里 legacy `SignalClaw` 明显优于 `SignalClaw-Seed`。([GitHub][8]) 这很关键。
+
+这说明你下一步不应该直接问：
+
+```text
+为什么 evolved 比 seed 差？
+```
+
+而应该先问：
+
+```text
+为什么 seed artifact path 比 legacy SignalClaw 差？
+```
+
+建议做一个专门的 parity test：
+
+```text
+同一 SUMO 场景
+同一 seed
+同一 tls
+同一 observation
+legacy SignalClaw 输出什么？
+seed artifact CycleSkill 输出什么？
+seed artifact PhaseSkill 输出什么？
+runner 实际下发什么？
+```
+
+记录成表：
+
+```text
+t
+tls_id
+current_phase
+legacy_plan.green_times
+seed_cycle_plan.green_times
+seed_phase_command
+actual_traci_command
+queue
+waiting
+```
+
+目标是先让：
+
+```text
+SignalClaw legacy ≈ SignalClaw-Seed artifact
+```
+
+至少在动作分布和主要指标上接近。否则后续 evolved 的比较基准是不稳的。
+
+---
+
+## 9. Artifact manifest 还要补“可部署证据”
+
+现在 artifact 已经有目录和保存逻辑，但 manifest 还不够用于严肃实验。`run_evolution.py` 保存 evolved skill 时会写 `skill.py` 和 `manifest.json`，并标记 `frozen=true`、`online_learning=false`、`exploration=false`，这很好；但当前保存的 metrics 主要是 `replay_score`，没有把 SUMO sealed evidence 作为硬字段。([GitHub][7])
+
+建议 manifest 至少补：
+
+```json
+{
+  "skill_id": "...",
+  "skill_type": "cycle",
+  "crossing_id": "...",
+  "parent_skill_ids": ["..."],
+  "code_hash": "...",
+  "prompt_hash": "...",
+  "feature_mask": {
+    "predicted_arrival": false,
+    "neighbor_pressure": true
+  },
+  "static_check_passed": true,
+  "behavior_contract_passed": true,
+  "replay_passed": true,
+  "has_real_sumo_report": true,
+  "paired_eval_passed": true,
+  "accepted_for_deployment": true,
+  "incumbent_skill_id": "...",
+  "scenario_hashes": ["..."],
+  "route_hash": "...",
+  "topology_hash": "...",
+  "metrics": {
+    "avg_queue_delta": -0.03,
+    "avg_waiting_delta": -0.04,
+    "completed_vehicles_delta": 0.01,
+    "safety_violations": 0,
+    "phase_starvation": 0
+  }
+}
+```
+
+然后 cohort 也要记录：
+
+```json
+{
+  "cohort_id": "...",
+  "source": "sealed_sumo_champion",
+  "glm_used_online": false,
+  "exploration": false,
+  "all_skills_accepted_for_deployment": true
+}
+```
+
+---
+
+## 10. one-hop neighbor graph 要从“可选”变成“可验证”
+
+OnlineController 里已经会通过 `neighbor_graph.get_neighbor_tls_ids()` 构造邻居 observation。([GitHub][9]) 但 runner / evolution 里如果 topology 缺失或为空，系统仍然可能继续跑。
+
+这对开发方便，但对论文/实验不安全。因为你的项目目标是“多路口协同”，如果实际 neighbors 是空的，Skill 就退化成本地控制。
+
+建议加 topology validation：
+
+```text
+每个 tls 至少要声明：
+  upstream_neighbors
+  downstream_neighbors
+  travel_time_s
+  movement_mapping
+  phase_to_downstream_lanes
+
+如果 expected_neighbor_count > 0 但实际为空：
+  sealed evaluation 直接 fail
+```
+
+并在 run manifest 里写：
+
+```json
+{
+  "topology_loaded": true,
+  "tls_neighbor_counts": {
+    "tls_A": {"upstream": 1, "downstream": 1},
+    "tls_B": {"upstream": 2, "downstream": 1}
+  }
+}
+```
+
+---
+
+## 11. 后续开发顺序建议
+
+我建议按下面顺序做，不要跳。
+
+### Milestone 0：禁止“变差候选”进入 deployable cohort
+
+这是最急的。
+
+要改：
+
+```text
+per_intersection.py
+selector.py
+run_evolution.py
+manifest schema
+cohort builder
 ```
 
 验收标准：
 
 ```text
-1. 每轮可以产生坏 candidate，但坏 candidate 只能进 archive。
-2. Deployable champion 必须有真实 SUMO sealed report。
-3. Champion 更新必须相对 incumbent 通过 paired non-degradation gate。
-4. 如果没有 candidate 通过，champion 保持不变。
-5. MaxPressure-Canonical 必须作为强 baseline 参与所有 sealed comparison。
-6. Evolved cohort 如果比 Seed 差，系统必须自动回退 Seed，而不是输出 Evolved。
+没有真实 SUMO report -> 不可部署
+没有 paired incumbent comparison -> 不可部署
+没有候选通过 -> 保持 seed/incumbent
+archive_best 不得进入 evolved_cohort
+evolved_cohort 只能引用 accepted_for_deployment=true 的 Skill
 ```
 
-一句话：
+### Milestone 1：让 runner 真正执行双 Skill
 
-> **Meta Optimization 的核心不是“让 GLM 每次都写出更好算法”，而是“让系统只接受真的更好的算法”。**
+要改：
 
-这才是交通控制里可靠的进化。
+```text
+runner.py
+online_controller.py / command adapter
+TraCI apply command layer
+stats logging
+```
 
-[1]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/results/summary.json "raw.githubusercontent.com"
-[2]: https://www.sciencedirect.com/science/article/abs/pii/S0968090X20307324?utm_source=chatgpt.com "Max-pressure signal control with cyclical phase structure"
-[3]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/signalclaw/skills/max_pressure.py "raw.githubusercontent.com"
-[4]: https://github.com/Radar-Lei/SignalClawLigh/blob/main/signalclaw/experiments/runner.py "SignalClawLigh/signalclaw/experiments/runner.py at main · Radar-Lei/SignalClawLigh · GitHub"
-[5]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/signalclaw/evolution/selector.py "raw.githubusercontent.com"
-[6]: https://github.com/Radar-Lei/SignalClawLigh/blob/main/signalclaw/evolution/run_evolution.py "SignalClawLigh/signalclaw/evolution/run_evolution.py at main · Radar-Lei/SignalClawLigh · GitHub"
-[7]: https://deepmind.google/blog/funsearch-making-new-discoveries-in-mathematical-sciences-using-large-language-models/?utm_source=chatgpt.com "FunSearch: Making new discoveries in mathematical ..."
+验收标准：
+
+```text
+cycle_skill.plan() 被调用
+phase_skill.decide() 被调用
+hold/switch/extend/shorten 有真实统计
+setPhase / setPhaseDuration 与 PhaseCommand 对齐
+yellow/all-red 不被破坏
+online_glm_calls = 0
+```
+
+### Milestone 2：对齐 legacy SignalClaw 和 seed artifact
+
+要做：
+
+```text
+同场景同 seed 跑 legacy SignalClaw
+同场景同 seed 跑 seed cohort
+逐步对比 observation、plan、command、TraCI 下发结果
+```
+
+验收标准：
+
+```text
+SignalClaw-Seed artifact 不应明显差于 legacy SignalClaw
+否则先修 artifact path，不进入 GLM 进化
+```
+
+### Milestone 3：feature availability / predicted_arrival gating
+
+要做：
+
+```text
+建立 feature_mask
+prompt builder 只暴露可用特征
+DSL compiler 禁止不可用特征
+AST 检查候选代码是否访问不可用字段
+```
+
+验收标准：
+
+```text
+predicted_arrival 未接入时，候选 Skill 不能依赖 predicted_arrival
+```
+
+### Milestone 4：sealed SUMO tournament
+
+要做：
+
+```text
+candidate vs incumbent
+同 route seed
+同 demand seed
+同 scenario hash
+多 seed
+peak/offpeak/high/low/incident 场景
+```
+
+验收标准：
+
+```text
+completed_vehicles 不下降
+avg_waiting 不显著上升
+avg_queue 不显著上升
+safety violation = 0
+phase starvation = 0
+通过才替换 champion
+```
+
+### Milestone 5：重新跑 baseline matrix
+
+要跑：
+
+```text
+FixedTime
+MaxPressure-CyclicAllocation
+MaxPressure-QueueOnly
+MaxPressure-Canonical
+MaxPressure-SwitchLossAware
+SignalClaw legacy
+SignalClaw-Seed
+SignalClaw-Evolved-Champion
+```
+
+验收标准：
+
+```text
+所有方法使用同一 metrics 定义
+所有方法使用同一 route/demand/scenario seed
+报告 completed、waiting、queue、travel time、safety、starvation
+```
+
+### Milestone 6：SQL cycle_state_view 接入
+
+这一阶段再做真实 SQL：
+
+```text
+crossing_id -> SUMO tls_id
+phase_id -> SUMO phase index
+traffic_flow_record -> queue/flow proxy
+prediction_record -> predicted_arrival
+run_timing_adjustment -> historical action
+wave/wave_node -> offset/coordination context
+```
+
+目标产物：
+
+```text
+artifacts/data/cycle_state_view.parquet
+artifacts/data/sql_sumo_mapping.yaml
+```
+
+这一步完成后，ReplayEvaluator 才真正有业务价值。
+
+### Milestone 7：cohort-level 进化
+
+单路口 champion 通过后，还要做全局 cohort 验证。因为某个路口本地变好，可能把车推给下游。
+
+建议：
+
+```text
+每个路口保留 top-K deployable candidates
+中心做 beam search / tournament
+选全局 corridor 不退化 cohort
+```
+
+验收标准：
+
+```text
+global completed 不下降
+global waiting 不上升
+任一路口 starvation 不增加
+下游 spillback 不增加
+```
+
+---
+
+## 12. 我建议你现在立刻改的 5 个点
+
+第一，删除 `champion else archive_best` 这个 deployable fallback。archive candidate 不能替代 incumbent。
+
+第二，`evolved_cohort.json` 只能由 `accepted_for_deployment=true` 的 skill 构建；否则继续引用 seed cohort。
+
+第三，runner 改成真正调用 `OnlineController.step()` 或至少显式调用 `phase_skill.decide()`，否则 PhaseSkill 进化没有意义。
+
+第四，`predicted_arrival` 未接入前，在 prompt / DSL / AST 里禁止候选使用它。
+
+第五，先把 `SignalClaw legacy` 和 `SignalClaw-Seed artifact` 对齐，再评价 `SignalClaw-Evolved`。
+
+---
+
+## 13. 总结一句话
+
+你现在的仓库已经有了正确的工程骨架，但下一阶段的核心不是“继续生成更多 Skill”，而是：
+
+> **把 evolution 从“能生成候选”升级成“只接受真实 sealed SUMO 中不退化的 champion”；把 runner 从“主要执行周期配绿”升级成“真实执行 CycleSkill + PhaseSkill 双闭环”；把 artifact 从“保存代码”升级成“保存可部署证据”。**
+
+这三件事做完以后，GLM 进化才会真正变成一个可靠系统，而不是一个会偶尔把坏候选写进 evolved cohort 的实验脚本。
+
+[1]: https://github.com/Radar-Lei/SignalClawLigh "GitHub - Radar-Lei/SignalClawLigh: SignalClawLigh project workspace · GitHub"
+[2]: https://github.com/Radar-Lei/SignalClawLigh/tree/main/signalclaw/evolution "SignalClawLigh/signalclaw/evolution at main · Radar-Lei/SignalClawLigh · GitHub"
+[3]: https://github.com/Radar-Lei/SignalClawLigh/tree/main/signalclaw/execution "SignalClawLigh/signalclaw/execution at main · Radar-Lei/SignalClawLigh · GitHub"
+[4]: https://github.com/Radar-Lei/SignalClawLigh/tree/main/signalclaw/skills "SignalClawLigh/signalclaw/skills at main · Radar-Lei/SignalClawLigh · GitHub"
+[5]: https://github.com/Radar-Lei/SignalClawLigh/blob/main/signalclaw/evolution/selector.py "SignalClawLigh/signalclaw/evolution/selector.py at main · Radar-Lei/SignalClawLigh · GitHub"
+[6]: https://github.com/Radar-Lei/SignalClawLigh/blob/main/signalclaw/evolution/per_intersection.py "SignalClawLigh/signalclaw/evolution/per_intersection.py at main · Radar-Lei/SignalClawLigh · GitHub"
+[7]: https://github.com/Radar-Lei/SignalClawLigh/blob/main/signalclaw/evolution/run_evolution.py "SignalClawLigh/signalclaw/evolution/run_evolution.py at main · Radar-Lei/SignalClawLigh · GitHub"
+[8]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/results/summary.json "raw.githubusercontent.com"
+[9]: https://github.com/Radar-Lei/SignalClawLigh/blob/main/signalclaw/execution/online_controller.py "SignalClawLigh/signalclaw/execution/online_controller.py at main · Radar-Lei/SignalClawLigh · GitHub"
+[10]: https://github.com/Radar-Lei/SignalClawLigh/blob/main/signalclaw/experiments/runner.py "SignalClawLigh/signalclaw/experiments/runner.py at main · Radar-Lei/SignalClawLigh · GitHub"
+[11]: https://github.com/Radar-Lei/SignalClawLigh/blob/main/signalclaw/evolution/evaluator_sumo.py "SignalClawLigh/signalclaw/evolution/evaluator_sumo.py at main · Radar-Lei/SignalClawLigh · GitHub"
+[12]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/signalclaw/skills/max_pressure.py "raw.githubusercontent.com"

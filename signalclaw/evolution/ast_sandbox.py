@@ -6,6 +6,7 @@
 - 禁止属性访问危险对象
 - 验证函数接口正确性
 - 检查代码确定性（无随机数）
+- Feature Mask 门控（禁止访问不可用特征）
 """
 
 from __future__ import annotations
@@ -13,7 +14,9 @@ from __future__ import annotations
 import ast
 import math
 from dataclasses import dataclass, field
-from typing import List, Set
+from typing import List, Optional, Set
+
+from signalclaw.evolution.feature_mask import FeatureMask
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +39,16 @@ class ASTCheckResult:
 
 class ASTSandbox:
     """AST 静态安全检查器。"""
+
+    def __init__(self, feature_mask: Optional[FeatureMask] = None):
+        """初始化 ASTSandbox。
+
+        Parameters
+        ----------
+        feature_mask : FeatureMask, optional
+            特征可用性门控。为 None 时使用默认配置（predicted_arrival=False）。
+        """
+        self.feature_mask = feature_mask or FeatureMask()
 
     # 完全禁止的模块/名字
     FORBIDDEN_NAMES: Set[str] = {
@@ -167,6 +180,12 @@ class ASTSandbox:
 
         # ---- Step 9: 计算复杂度 ----
         complexity = self._compute_complexity(tree)
+
+        # ---- Step 9.5: Feature Mask 检查 ----
+        mask_result = self.feature_mask.check_ast_code(code)
+        if not mask_result.passed:
+            for v in mask_result.violations:
+                violations.append(v.message)
 
         # ---- Step 10: 检查 try/except ----
         for node in ast.walk(tree):

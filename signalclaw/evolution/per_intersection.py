@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -25,11 +26,14 @@ from signalclaw.evolution.archive import ArchiveEntry, SkillArchive
 from signalclaw.evolution.ast_sandbox import ASTSandbox
 from signalclaw.evolution.evaluator_replay import ReplayEvaluator
 from signalclaw.evolution.evaluator_sumo import SUMOEvaluator, SUMOEvalReport
+from signalclaw.evolution.feature_mask import FeatureMask
 from signalclaw.evolution.glm_mutator import CandidateSkill, GLMSkillMutator
 from signalclaw.evolution.prompt_builder import PromptBuilder
 from signalclaw.evolution.selector import SkillSelector
 from signalclaw.reference.prior_checker import PriorConsistencyChecker
 from signalclaw.reference.profile_schema import SQLReferenceProfile
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +82,7 @@ class PerIntersectionEvolver:
         sumo_evaluator: Optional[SUMOEvaluator] = None,
         cohort: Optional["SkillCohort"] = None,
         sql_profile: Optional[SQLReferenceProfile] = None,
+        feature_mask: Optional[FeatureMask] = None,
     ):
         self.crossing_id = crossing_id
         self.glm_mutator = glm_mutator
@@ -91,6 +96,7 @@ class PerIntersectionEvolver:
         self.sumo_evaluator = sumo_evaluator
         self.cohort = cohort
         self.sql_profile = sql_profile
+        self.feature_mask = feature_mask or FeatureMask()
         self.crossing_profile = _build_crossing_profile(
             crossing_id, constraints, phase_count
         )
@@ -292,6 +298,14 @@ class PerIntersectionEvolver:
                 self.archive.add(entry)
                 continue
 
+            # Feature Mask 检查（AST 通过后、Replay 评估之前）
+            mask_result = self.feature_mask.check_ast_code(candidate.code)
+            if not mask_result.passed:
+                violation_msgs = "; ".join(v.message for v in mask_result.violations[:3])
+                entry.rejection_reason = f"Feature Mask 违规: {violation_msgs}"
+                self.archive.add(entry)
+                continue
+
             # Prior Consistency Check（AST 通过后、Replay 评估之前）
             if self.prior_checker is not None:
                 prior_result = self.prior_checker.check(candidate.code, "cycle")
@@ -342,15 +356,32 @@ class PerIntersectionEvolver:
         if not candidates:
             return None
 
-        # 分层选择：archive best 用于记录，deployable champion 用于部署
+        # archive_best 仅用于日志/分析，不能作为部署候选。
+        # archive_best 选取基于 replay/AST 分数，未经过 SUMO sealed eval
+        # 和 non-degradation gate 验证，回退到它意味着可能部署一个
+        # 实际表现不如 incumbent 的变体，破坏"champion 不能越进化越差"的保证。
         archive_best = self.selector.select_archive_best(
             candidates, seed_entry=None,
         )
+        if archive_best is not None:
+            logger.info(
+                "Cycle 进化 archive_best=%s (仅分析用，不参与部署)",
+                archive_best.candidate_id,
+            )
+
         champion = self.selector.select_deployable_champion(
             candidates, incumbent=self._current_incumbent("cycle"),
+            cohort=self.cohort, crossing_id=self.crossing_id,
         )
-        # 如果有 deployable champion 则优先返回，否则返回 archive best
-        return champion if champion is not None else archive_best
+        # 只返回 deployable champion；没有通过时返回 None（保留 incumbent），
+        # 绝不 fallback 到 archive_best。
+        if champion is not None:
+            return champion
+
+        logger.info(
+            "Cycle 进化: 无候选通过 deployable champion 门槛，本轮保持 incumbent"
+        )
+        return None
 
     def _evolve_phase(
         self,
@@ -425,6 +456,14 @@ class PerIntersectionEvolver:
                 self.archive.add(entry)
                 continue
 
+            # Feature Mask 检查（AST 通过后、Replay 评估之前）
+            mask_result = self.feature_mask.check_ast_code(candidate.code)
+            if not mask_result.passed:
+                violation_msgs = "; ".join(v.message for v in mask_result.violations[:3])
+                entry.rejection_reason = f"Feature Mask 违规: {violation_msgs}"
+                self.archive.add(entry)
+                continue
+
             # Prior Consistency Check（AST 通过后、Replay 评估之前）
             if self.prior_checker is not None:
                 prior_result = self.prior_checker.check(candidate.code, "phase")
@@ -474,15 +513,31 @@ class PerIntersectionEvolver:
         if not candidates:
             return None
 
-        # 分层选择：archive best 用于记录，deployable champion 用于部署
+        # archive_best 仅用于日志/分析，不能作为部署候选。
+        # 理由同 _evolve_cycle：archive_best 未经过 SUMO sealed eval 和
+        # non-degradation gate，回退到它会破坏单调进化保证。
         archive_best = self.selector.select_archive_best(
             candidates, seed_entry=None,
         )
+        if archive_best is not None:
+            logger.info(
+                "Phase 进化 archive_best=%s (仅分析用，不参与部署)",
+                archive_best.candidate_id,
+            )
+
         champion = self.selector.select_deployable_champion(
             candidates, incumbent=self._current_incumbent("phase"),
+            cohort=self.cohort, crossing_id=self.crossing_id,
         )
-        # 如果有 deployable champion 则优先返回，否则返回 archive best
-        return champion if champion is not None else archive_best
+        # 只返回 deployable champion；没有通过时返回 None（保留 incumbent），
+        # 绝不 fallback 到 archive_best。
+        if champion is not None:
+            return champion
+
+        logger.info(
+            "Phase 进化: 无候选通过 deployable champion 门槛，本轮保持 incumbent"
+        )
+        return None
 
     # ======================================================================
     # Internal: Helpers

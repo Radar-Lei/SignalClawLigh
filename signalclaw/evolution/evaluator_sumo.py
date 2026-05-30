@@ -9,10 +9,18 @@
 3. 收集该路口的交通指标（等待时间、排队长度、吞吐量等）
 4. 多种子评估取平均
 5. 评估完毕恢复原 skill
+
+Sealed 模式（SealedSUMOEvaluator）：
+- 用于 deployable champion 的必需条件
+- 做 paired evaluation：candidate vs incumbent
+- 使用相同 route seed、demand seed、scenario hash
+- 返回结构化的对比结果（delta 指标）
+- 支持多 seed 重复评估
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -69,6 +77,89 @@ class SUMOEvalReport:
     @classmethod
     def from_dict(cls, d: dict) -> "SUMOEvalReport":
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+# ---------------------------------------------------------------------------
+# Paired Evaluation Report
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PairedEvalReport:
+    """Sealed paired evaluation 的结构化对比报告。
+
+    对 candidate 和 incumbent 使用完全相同的 seed、场景进行 SUMO 仿真，
+    然后比较关键指标，判定 candidate 是否通过非退化门槛。
+    """
+
+    candidate_id: str
+    incumbent_id: str
+    crossing_id: str
+    skill_type: str
+
+    # incumbent 和 candidate 的各自指标
+    incumbent_metrics: Dict[str, float] = field(default_factory=dict)
+    candidate_metrics: Dict[str, float] = field(default_factory=dict)
+
+    # delta 指标（candidate - incumbent），负值表示改善
+    delta: Dict[str, float] = field(default_factory=dict)
+
+    # 评估使用的 seeds
+    seeds_used: List[int] = field(default_factory=list)
+    n_seeds: int = 1
+
+    # 非退化门槛判定
+    passed: bool = False
+    rejection_reason: str = ""
+
+    # 每个门槛的详细检查结果
+    gate_details: Dict[str, dict] = field(default_factory=dict)
+
+    # 各自的完整 SUMO 报告（用于存档）
+    incumbent_report: Optional[Dict] = None
+    candidate_report: Optional[Dict] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PairedEvalReport":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+# ---------------------------------------------------------------------------
+# Non-degradation gates (thresholds for paired evaluation)
+# ---------------------------------------------------------------------------
+
+NON_DEGRADATION_GATES = {
+    "completed_vehicles": {
+        "direction": "lower_bound",   # candidate 不能低于 incumbent 的 X%
+        "threshold_ratio": 0.99,       # 不低于 incumbent 的 99%
+        "metric_key": "throughput",    # 对应 metrics 中的键名
+        "description": "completed_vehicles 不低于 incumbent 的 99%",
+    },
+    "avg_queue": {
+        "direction": "upper_bound",    # candidate 不能高于 incumbent 的 X%
+        "threshold_ratio": 1.03,       # 不超过 incumbent 的 103%
+        "metric_key": "mean_queue",
+        "description": "avg_queue 不超过 incumbent 的 103%",
+    },
+    "avg_waiting_time": {
+        "direction": "upper_bound",
+        "threshold_ratio": 1.03,       # 不超过 incumbent 的 103%
+        "metric_key": "mean_waiting",
+        "description": "avg_waiting_time 不超过 incumbent 的 103%",
+    },
+    "safety_violations": {
+        "direction": "absolute_zero",  # 必须为 0
+        "metric_key": "safety_overrides",
+        "description": "safety_violations 必须为 0",
+    },
+    "phase_starvation": {
+        "direction": "absolute_zero",  # 必须为 0
+        "metric_key": "phase_starvation_count",
+        "description": "phase_starvation 必须为 0",
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -873,3 +964,424 @@ class SUMOEvaluator:
             aggregated[key] = weighted_sum / total_weight
 
         return aggregated
+
+
+# ==========================================================================
+# SealedSUMOEvaluator — Deployable Champion 的必需评估器
+# ==========================================================================
+
+class SealedSUMOEvaluator:
+    """Sealed SUMO 评估器 — 用于 deployable champion 的必需条件。
+
+    与 SUMOEvaluator 的区别：
+    - 做 paired evaluation：candidate vs incumbent
+    - 使用完全相同的 route seed、demand seed、scenario hash
+    - 先跑 incumbent 基线，再跑 candidate
+    - 返回结构化的 PairedEvalReport（含 delta 指标）
+    - 支持多 seed 重复评估
+    - 严格非退化门槛检查
+
+    使用方式：
+        evaluator = SealedSUMOEvaluator(
+            sumocfg_path="...",
+            neighbor_graph=...,
+            constraints=...,
+        )
+        report = evaluator.paired_evaluate(
+            incumbent_code=incumbent_code,
+            candidate_code=candidate_code,
+            skill_type="cycle",
+            crossing_id="123",
+            cohort=cohort,
+        )
+        if report.passed:
+            # candidate 可以成为 deployable champion
+    """
+
+    def __init__(
+        self,
+        sumocfg_path: str,
+        neighbor_graph: NeighborGraph,
+        constraints: NetworkConstraints,
+        eval_duration: float = 600.0,
+        n_seeds: int = 3,
+        step_length: float = 1.0,
+        decision_interval: float = 5.0,
+        warmup_steps: int = 100,
+    ):
+        """
+        Parameters 与 SUMOEvaluator 基本一致，但没有 thresholds 参数
+        （使用固定的非退化门槛 NON_DEGRADATION_GATES）。
+        """
+        # 内部持有 SUMOEvaluator 实例来复用仿真逻辑
+        self._inner = SUMOEvaluator(
+            sumocfg_path=sumocfg_path,
+            neighbor_graph=neighbor_graph,
+            constraints=constraints,
+            eval_duration=eval_duration,
+            n_seeds=n_seeds,
+            step_length=step_length,
+            decision_interval=decision_interval,
+            warmup_steps=warmup_steps,
+        )
+        self.n_seeds = n_seeds
+
+    @property
+    def sumocfg_path(self) -> str:
+        return self._inner.sumocfg_path
+
+    @sumocfg_path.setter
+    def sumocfg_path(self, value: str) -> None:
+        self._inner.sumocfg_path = value
+
+    # ==================================================================
+    # Public API
+    # ==================================================================
+
+    def paired_evaluate(
+        self,
+        incumbent_code: str,
+        candidate_code: str,
+        skill_type: str,
+        crossing_id: str,
+        cohort: SkillCohort,
+        seeds: Optional[List[int]] = None,
+    ) -> PairedEvalReport:
+        """执行 sealed paired evaluation。
+
+        流程：
+        1. 生成一组固定的 seeds
+        2. 用这些 seeds 先评估 incumbent
+        3. 用完全相同的 seeds 评估 candidate
+        4. 比较指标，判定是否通过非退化门槛
+
+        Parameters
+        ----------
+        incumbent_code : str
+            当前 incumbent（seed 或上一代 champion）的代码
+        candidate_code : str
+            候选代码
+        skill_type : str
+            "cycle" 或 "phase"
+        crossing_id : str
+            目标路口 ID
+        cohort : SkillCohort
+            当前 skill 集合（其他路口保持不变）
+        seeds : list[int], optional
+            自定义种子列表；如果不提供则自动生成 n_seeds 个
+
+        Returns
+        -------
+        PairedEvalReport
+            结构化的对比报告
+        """
+        if seeds is None:
+            seeds = [42 + i * 7 for i in range(self.n_seeds)]
+
+        candidate_id = (
+            f"paired_{crossing_id}_{skill_type}_{uuid.uuid4().hex[:8]}"
+        )
+        incumbent_id = (
+            f"incumbent_{crossing_id}_{skill_type}"
+        )
+
+        logger.info(
+            "Sealed paired evaluation 开始: crossing=%s type=%s n_seeds=%d",
+            crossing_id, skill_type, len(seeds),
+        )
+
+        # ---- Step 1: 评估 incumbent（基线） ----
+        incumbent_report = self._inner.evaluate_multi_seed(
+            candidate_code=incumbent_code,
+            skill_type=skill_type,
+            crossing_id=crossing_id,
+            cohort=cohort,
+            seeds=seeds,
+        )
+        incumbent_metrics = incumbent_report.metrics
+
+        if incumbent_report.score == float("inf"):
+            # incumbent 评估失败（SUMO 不可用等）
+            return PairedEvalReport(
+                candidate_id=candidate_id,
+                incumbent_id=incumbent_id,
+                crossing_id=crossing_id,
+                skill_type=skill_type,
+                incumbent_metrics={},
+                candidate_metrics={},
+                seeds_used=seeds,
+                n_seeds=len(seeds),
+                passed=False,
+                rejection_reason=f"Incumbent SUMO 评估失败: "
+                                 f"{'; '.join(incumbent_report.violations[:3])}",
+                incumbent_report=incumbent_report.to_dict(),
+            )
+
+        logger.info(
+            "Incumbent 评估完成: score=%.4f, mean_waiting=%.2f, "
+            "mean_queue=%.2f, throughput=%.1f",
+            incumbent_report.score,
+            incumbent_metrics.get("mean_waiting", 0.0),
+            incumbent_metrics.get("mean_queue", 0.0),
+            incumbent_metrics.get("throughput", 0.0),
+        )
+
+        # ---- Step 2: 评估 candidate（使用完全相同的 seeds） ----
+        candidate_report = self._inner.evaluate_multi_seed(
+            candidate_code=candidate_code,
+            skill_type=skill_type,
+            crossing_id=crossing_id,
+            cohort=cohort,
+            seeds=seeds,
+        )
+        candidate_metrics = candidate_report.metrics
+
+        if candidate_report.score == float("inf"):
+            return PairedEvalReport(
+                candidate_id=candidate_id,
+                incumbent_id=incumbent_id,
+                crossing_id=crossing_id,
+                skill_type=skill_type,
+                incumbent_metrics=incumbent_metrics,
+                candidate_metrics={},
+                seeds_used=seeds,
+                n_seeds=len(seeds),
+                passed=False,
+                rejection_reason=f"Candidate SUMO 评估失败: "
+                                 f"{'; '.join(candidate_report.violations[:3])}",
+                incumbent_report=incumbent_report.to_dict(),
+                candidate_report=candidate_report.to_dict(),
+            )
+
+        logger.info(
+            "Candidate 评估完成: score=%.4f, mean_waiting=%.2f, "
+            "mean_queue=%.2f, throughput=%.1f",
+            candidate_report.score,
+            candidate_metrics.get("mean_waiting", 0.0),
+            candidate_metrics.get("mean_queue", 0.0),
+            candidate_metrics.get("throughput", 0.0),
+        )
+
+        # ---- Step 3: 计算 delta ----
+        delta = self._compute_delta(incumbent_metrics, candidate_metrics)
+
+        # ---- Step 4: 非退化门槛检查 ----
+        passed, rejection_reason, gate_details = self._check_non_degradation_gates(
+            incumbent_metrics, candidate_metrics,
+        )
+
+        report = PairedEvalReport(
+            candidate_id=candidate_id,
+            incumbent_id=incumbent_id,
+            crossing_id=crossing_id,
+            skill_type=skill_type,
+            incumbent_metrics=incumbent_metrics,
+            candidate_metrics=candidate_metrics,
+            delta=delta,
+            seeds_used=seeds,
+            n_seeds=len(seeds),
+            passed=passed,
+            rejection_reason=rejection_reason,
+            gate_details=gate_details,
+            incumbent_report=incumbent_report.to_dict(),
+            candidate_report=candidate_report.to_dict(),
+        )
+
+        if passed:
+            logger.info(
+                "Sealed paired evaluation PASSED: %s vs %s",
+                candidate_id, incumbent_id,
+            )
+        else:
+            logger.info(
+                "Sealed paired evaluation FAILED: %s vs %s — %s",
+                candidate_id, incumbent_id, rejection_reason,
+            )
+
+        return report
+
+    def evaluate_candidate(
+        self,
+        candidate_code: str,
+        skill_type: str,
+        crossing_id: str,
+        cohort: SkillCohort,
+        seed: int = 42,
+    ) -> SUMOEvalReport:
+        """向后兼容的 evaluate_candidate 接口 — 委托给内部 SUMOEvaluator。"""
+        return self._inner.evaluate_candidate(
+            candidate_code=candidate_code,
+            skill_type=skill_type,
+            crossing_id=crossing_id,
+            cohort=cohort,
+            seed=seed,
+        )
+
+    def evaluate_multi_seed(
+        self,
+        candidate_code: str,
+        skill_type: str,
+        crossing_id: str,
+        cohort: SkillCohort,
+        seeds: Optional[List[int]] = None,
+    ) -> SUMOEvalReport:
+        """向后兼容的 evaluate_multi_seed 接口 — 委托给内部 SUMOEvaluator。"""
+        return self._inner.evaluate_multi_seed(
+            candidate_code=candidate_code,
+            skill_type=skill_type,
+            crossing_id=crossing_id,
+            cohort=cohort,
+            seeds=seeds,
+        )
+
+    def evaluate_multi_scenario(
+        self,
+        candidate_code: str,
+        skill_type: str,
+        crossing_id: str,
+        cohort: SkillCohort,
+        scenario_catalog: ScenarioCatalog,
+        n_seeds: int = 2,
+    ) -> SUMOEvalReport:
+        """向后兼容的 evaluate_multi_scenario 接口 — 委托给内部 SUMOEvaluator。"""
+        return self._inner.evaluate_multi_scenario(
+            candidate_code=candidate_code,
+            skill_type=skill_type,
+            crossing_id=crossing_id,
+            cohort=cohort,
+            scenario_catalog=scenario_catalog,
+            n_seeds=n_seeds,
+        )
+
+    # ==================================================================
+    # Delta & Gate computation
+    # ==================================================================
+
+    @staticmethod
+    def _compute_delta(
+        incumbent_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+    ) -> Dict[str, float]:
+        """计算 candidate 相对 incumbent 的 delta（candidate - incumbent）。
+
+        负值表示 candidate 更好（如 waiting_time 更低），正值表示更差。
+        throughput 的 delta 是正值表示更好。
+        """
+        delta: Dict[str, float] = {}
+
+        # 标准指标 delta
+        standard_keys = [
+            "mean_waiting", "mean_queue", "max_queue",
+            "throughput", "avg_throughput_per_step",
+            "safety_overrides", "safety_override_ratio",
+            "phase_starvation_count", "phase_starvation_ratio",
+            "spillback_ratio", "spillback_events",
+        ]
+
+        for key in standard_keys:
+            inc_val = incumbent_metrics.get(key, 0.0)
+            cand_val = candidate_metrics.get(key, 0.0)
+            delta[key] = round(cand_val - inc_val, 6)
+
+        # 归一化 delta（相对变化率）
+        for key in standard_keys:
+            inc_val = incumbent_metrics.get(key, 0.0)
+            if abs(inc_val) > 1e-9:
+                delta[f"{key}_ratio"] = round(
+                    (candidate_metrics.get(key, 0.0) - inc_val) / abs(inc_val),
+                    6,
+                )
+            else:
+                delta[f"{key}_ratio"] = 0.0
+
+        return delta
+
+    @staticmethod
+    def _check_non_degradation_gates(
+        incumbent_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+    ) -> Tuple[bool, str, Dict[str, dict]]:
+        """检查所有非退化门槛。
+
+        Returns
+        -------
+        (passed, rejection_reason, gate_details)
+            passed: True 表示通过所有门槛
+            rejection_reason: 第一个失败的门槛的原因（空字符串表示全部通过）
+            gate_details: 每个门槛的详细检查结果
+        """
+        gate_details: Dict[str, dict] = {}
+        all_passed = True
+        first_failure = ""
+
+        for gate_name, gate_spec in NON_DEGRADATION_GATES.items():
+            metric_key = gate_spec["metric_key"]
+            direction = gate_spec["direction"]
+            description = gate_spec["description"]
+
+            inc_val = incumbent_metrics.get(metric_key, 0.0)
+            cand_val = candidate_metrics.get(metric_key, 0.0)
+
+            detail: Dict[str, Any] = {
+                "gate": gate_name,
+                "description": description,
+                "incumbent_value": inc_val,
+                "candidate_value": cand_val,
+                "passed": True,
+            }
+
+            if direction == "lower_bound":
+                # candidate 不能低于 incumbent * threshold_ratio
+                threshold_ratio = gate_spec["threshold_ratio"]
+                lower_bound = inc_val * threshold_ratio
+                gate_passed = cand_val >= lower_bound
+                detail["threshold"] = lower_bound
+                detail["threshold_ratio"] = threshold_ratio
+                if not gate_passed:
+                    detail["reason"] = (
+                        f"{metric_key}={cand_val:.2f} < "
+                        f"incumbent*{threshold_ratio}={lower_bound:.2f}"
+                    )
+
+            elif direction == "upper_bound":
+                # candidate 不能高于 incumbent * threshold_ratio
+                threshold_ratio = gate_spec["threshold_ratio"]
+                upper_bound = inc_val * threshold_ratio
+                # 如果 incumbent 为 0，使用绝对容差
+                if abs(inc_val) < 1e-9:
+                    gate_passed = cand_val <= 0.0
+                    detail["threshold"] = 0.0
+                else:
+                    gate_passed = cand_val <= upper_bound
+                    detail["threshold"] = upper_bound
+                detail["threshold_ratio"] = threshold_ratio
+                if not gate_passed:
+                    detail["reason"] = (
+                        f"{metric_key}={cand_val:.2f} > "
+                        f"incumbent*{threshold_ratio}={upper_bound:.2f}"
+                    )
+
+            elif direction == "absolute_zero":
+                # candidate 的值必须为 0
+                gate_passed = cand_val <= 0.0
+                detail["threshold"] = 0.0
+                if not gate_passed:
+                    detail["reason"] = (
+                        f"{metric_key}={cand_val:.2f} > 0"
+                    )
+
+            else:
+                gate_passed = True
+                detail["reason"] = f"未知方向: {direction}"
+
+            detail["passed"] = gate_passed
+            gate_details[gate_name] = detail
+
+            if not gate_passed:
+                all_passed = False
+                if not first_failure:
+                    first_failure = (
+                        f"{description}: {detail.get('reason', '未通过')}"
+                    )
+
+        return all_passed, first_failure, gate_details

@@ -181,6 +181,38 @@ class ArchiveEntry:
         # 更新 has_real_sumo_report 标记
         self.has_real_sumo_report = self._check_real_sumo_report()
 
+    def set_sumo_report_from_paired(self, paired_report) -> None:
+        """从 PairedEvalReport 中提取 candidate 部分写入 sumo_report。
+
+        保留完整的 paired report 信息作为参考。
+        """
+        self.sumo_report = {
+            "candidate_id": paired_report.candidate_id,
+            "crossing_id": paired_report.crossing_id,
+            "skill_type": paired_report.skill_type,
+            "passed": paired_report.passed,
+            "score": 0.0,  # paired evaluation 没有 score，使用 0
+            "metrics": paired_report.candidate_metrics,
+            "violations": (
+                [paired_report.rejection_reason] if paired_report.rejection_reason else []
+            ),
+            "failure_cases": [],
+            "sim_duration": 0.0,
+            "seed": paired_report.seeds_used[0] if paired_report.seeds_used else 42,
+            "n_seeds": paired_report.n_seeds,
+            # 额外的 paired evaluation 字段
+            "paired_eval": {
+                "incumbent_id": paired_report.incumbent_id,
+                "incumbent_metrics": paired_report.incumbent_metrics,
+                "candidate_metrics": paired_report.candidate_metrics,
+                "delta": paired_report.delta,
+                "gate_details": paired_report.gate_details,
+                "seeds_used": paired_report.seeds_used,
+            },
+        }
+        # 更新 has_real_sumo_report 标记
+        self.has_real_sumo_report = bool(paired_report.candidate_metrics)
+
     def _check_real_sumo_report(self) -> bool:
         """判断 sumo_report 是否为真实评估结果。
 

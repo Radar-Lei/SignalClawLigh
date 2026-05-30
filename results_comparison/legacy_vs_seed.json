@@ -1,0 +1,50 @@
+{
+  "SignalClaw-Legacy": {
+    "method": "SignalClaw-Legacy",
+    "avg_travel_time": 334.351428927992,
+    "completed_vehicles": 8013,
+    "throughput_per_hour": 8013.0,
+    "avg_queue": 0.6606113868210642,
+    "avg_queue_source": "collector_time_weighted",
+    "max_queue": 894.0,
+    "avg_waiting_time": 126.76850118557344,
+    "waiting_time_source": "tripinfo",
+    "max_waiting_time": 234.09102730819245,
+    "avg_delay": 37651.98611111111,
+    "total_throughput": 0,
+    "total_stops": 958415,
+    "stops_source": "tripinfo_collector",
+    "steps": 360
+  },
+  "SignalClaw-Seed": {
+    "method": "SignalClaw-Seed",
+    "avg_travel_time": 355.4612145955601,
+    "completed_vehicles": 7838,
+    "throughput_per_hour": 7838.0,
+    "avg_queue": 0.8553956437827406,
+    "avg_queue_source": "collector_time_weighted",
+    "max_queue": 1209.0,
+    "avg_waiting_time": 144.9189844348048,
+    "waiting_time_source": "tripinfo",
+    "max_waiting_time": 342.77633289986994,
+    "avg_delay": 60897.59722222222,
+    "total_throughput": 0,
+    "total_stops": 1241008,
+    "stops_source": "tripinfo_collector",
+    "steps": 360,
+    "controller_stats": {
+      "cycle_plan_count": 2296,
+      "phase_command_count": 32048,
+      "phase_extend_count": 5800,
+      "phase_shorten_count": 0,
+      "phase_switch_count": 2885,
+      "phase_hold_count": 26248,
+      "safety_clip_count": 5562,
+      "safety_reject_count": 0,
+      "switch_cooldown_reject_count": 0,
+      "min_green_reject_count": 0,
+      "cycle_switch_limit_reject_count": 0,
+      "online_glm_calls": 0
+    }
+  }
+}

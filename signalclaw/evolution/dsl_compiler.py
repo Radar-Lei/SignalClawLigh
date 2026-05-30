@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
+from signalclaw.evolution.feature_mask import FeatureMask
+
 
 # ============================================================================
 # JSON Schema（用于 LLM 结构化输出约束）
@@ -372,6 +374,16 @@ class DslCompiler:
             python_code = result.python_code  # 可直接 ast.parse / exec
     """
 
+    def __init__(self, feature_mask: Optional[FeatureMask] = None):
+        """初始化编译器。
+
+        Parameters
+        ----------
+        feature_mask : FeatureMask, optional
+            特征可用性门控。为 None 时使用默认配置（predicted_arrival=False）。
+        """
+        self.feature_mask = feature_mask or FeatureMask()
+
     # ------------------------------------------------------------------
     # 参数约束默认值
     # ------------------------------------------------------------------
@@ -466,7 +478,13 @@ class DslCompiler:
         elif "w_queue" not in params:
             errors.append("parameters 中缺少必需的 w_queue 权重")
 
-        # 5) 按类型做进一步验证
+        # 5) Feature Mask 检查
+        mask_result = self.feature_mask.check_dsl(parsed)
+        if not mask_result.passed:
+            for v in mask_result.violations:
+                errors.append(f"Feature Mask 违规: {v.message}")
+
+        # 6) 按类型做进一步验证
         if skill_type == "cycle":
             self._validate_cycle_dsl(parsed, errors, warnings)
         else:
@@ -1124,11 +1142,10 @@ guards:
 
 _PHASE_EXAMPLE_YAML = """\
 skill_type: phase
-version_note: "基础相位微调器"
+version_note: "基础相位微调器（不含 predicted_arrival）"
 parameters:
   w_queue: 1.0
   w_waiting: 0.25
-  w_arrival: 0.8
   w_hunger: 0.6
   w_downstream: -1.2
   w_switch: -0.3

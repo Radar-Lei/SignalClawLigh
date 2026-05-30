@@ -2,12 +2,30 @@
 
 运行所有路口的 GLM 离线进化流程。
 
+两种运行模式：
+1. deployable 模式（默认，--require-sumo-for-champion）：
+   - 必须有 SUMO evaluator，否则直接报错
+   - 使用 SealedSUMOEvaluator 做 paired evaluation
+   - 只有通过非退化门槛的候选才会写入 evolved_cohort.json
+
+2. archive-only 模式（--archive-only）：
+   - 不要求 SUMO evaluator，可以没有
+   - 候选只保存到 archive，不写 deployable evolved_cohort.json
+   - 适合开发调试、离线分析
+
 用法:
+    # deployable 模式（默认）
     python -m signalclaw.evolution.run_evolution \\
         --cohort artifacts/skills/cohorts/seed_cohort.json \\
         --archive-dir artifacts/evolution_archive \\
         --n-candidates 3 \\
         --max-rounds 2
+
+    # archive-only 模式
+    python -m signalclaw.evolution.run_evolution \\
+        --cohort artifacts/skills/cohorts/seed_cohort.json \\
+        --archive-dir artifacts/evolution_archive \\
+        --archive-only
 """
 
 from __future__ import annotations
@@ -28,6 +46,7 @@ from signalclaw.core.constraints import IntersectionConstraints, NetworkConstrai
 from signalclaw.evolution.archive import ArchiveEntry, SkillArchive
 from signalclaw.evolution.ast_sandbox import ASTSandbox
 from signalclaw.evolution.evaluator_replay import ReplayEvaluator
+from signalclaw.evolution.feature_mask import DEFAULT_FEATURE_MASK, FeatureMask
 from signalclaw.evolution.glm_mutator import GLMSkillMutator
 from signalclaw.evolution.per_intersection import PerIntersectionEvolver
 from signalclaw.evolution.prompt_builder import PromptBuilder
@@ -79,21 +98,24 @@ def build_network_constraints(
 
 
 def _try_create_sumo_evaluator(scenario_catalog, network_constraints):
-    """尝试创建 SUMOEvaluator，失败时 graceful fallback 到 None。
+    """尝试创建 SealedSUMOEvaluator，失败时 graceful fallback 到 None。
 
-    SUMOEvaluator 需要三个关键依赖：
+    返回 SealedSUMOEvaluator 实例（用于 deployable 模式的 paired evaluation），
+    或者 None（archive-only 模式可以接受 None）。
+
+    SealedSUMOEvaluator 需要三个关键依赖：
     1. scenario_catalog 中至少有一个带有有效 sumocfg_file 的场景
     2. 从 sumocfg 或 net.xml 构建 NeighborGraph
     3. SUMO/TraCI 可用
 
-    任何一个条件不满足时，安全返回 None，进化流程将只使用 ReplayEvaluator。
+    任何一个条件不满足时，安全返回 None。
     """
     if scenario_catalog is None:
         print("[evolution] 无场景目录，跳过 SUMO 评估器创建")
         return None
 
     try:
-        from signalclaw.evolution.evaluator_sumo import SUMOEvaluator
+        from signalclaw.evolution.evaluator_sumo import SealedSUMOEvaluator
         from signalclaw.network.neighbor_graph import NeighborGraph
     except ImportError as e:
         print(f"[evolution] SUMO 依赖未安装，跳过 SUMO 评估: {e}")
@@ -142,15 +164,15 @@ def _try_create_sumo_evaluator(scenario_catalog, network_constraints):
         print("[evolution] 使用空邻居拓扑图（无路网拓扑信息）")
 
     try:
-        evaluator = SUMOEvaluator(
+        evaluator = SealedSUMOEvaluator(
             sumocfg_path=sumocfg_path,
             neighbor_graph=neighbor_graph,
             constraints=network_constraints,
         )
-        print(f"[evolution] SUMO 评估器创建成功（sumocfg={sumocfg_path}）")
+        print(f"[evolution] SealedSUMO 评估器创建成功（sumocfg={sumocfg_path}）")
         return evaluator
     except Exception as e:
-        print(f"[evolution] SUMO 评估器创建失败，将使用纯 Replay 评估: {e}")
+        print(f"[evolution] SealedSUMO 评估器创建失败: {e}")
         return None
 
 
@@ -165,6 +187,7 @@ def run_evolution(
     crossing_filter: Optional[list] = None,
     sql_profile_path: Optional[str] = None,
     scenario_catalog_path: Optional[str] = None,
+    archive_only: bool = False,
 ) -> Dict:
     """运行所有路口的进化。
 
@@ -191,6 +214,10 @@ def run_evolution(
         并在 AST 检查后执行 Prior Consistency Check。
     scenario_catalog_path : str, optional
         场景目录 JSON 路径。如果提供，SUMO 评估将使用多场景评估模式。
+    archive_only : bool
+        如果为 True，只保存候选到 archive，不要求 SUMO sealed evaluation，
+        也不写 deployable evolved_cohort.json。如果为 False（默认），必须有
+        SUMO sealed evaluation 才能写 evolved_cohort.json。
 
     Returns
     -------
@@ -229,16 +256,34 @@ def run_evolution(
     network_constraints = build_network_constraints(cohort)
 
     # ---- 5. 初始化组件 ----
+    # 创建统一的 FeatureMask（所有组件共享同一配置）
+    feature_mask = FeatureMask()
+    disabled = feature_mask.get_disabled_feature_names()
+    if disabled:
+        print(f"[evolution] Feature Mask: 以下特征不可用: {', '.join(disabled)}")
+
     glm_mutator = GLMSkillMutator(
         temperature=temperature,
         max_tokens=max_tokens,
     )
-    prompt_builder = PromptBuilder(sql_profile=sql_profile)
-    ast_sandbox = ASTSandbox()
+    prompt_builder = PromptBuilder(sql_profile=sql_profile, feature_mask=feature_mask)
+    ast_sandbox = ASTSandbox(feature_mask=feature_mask)
     archive = SkillArchive(archive_dir)
 
-    # 创建 SUMOEvaluator（graceful fallback：SUMO 未安装或缺少必要文件时跳过）
+    # 创建 SealedSUMOEvaluator
+    # deployable 模式下必须有 SUMO evaluator，否则直接报错
+    # archive-only 模式下可以没有
     sumo_evaluator = _try_create_sumo_evaluator(scenario_catalog, network_constraints)
+
+    if not archive_only and sumo_evaluator is None:
+        raise RuntimeError(
+            "Deployable 模式需要 SUMO evaluator，但创建失败。"
+            "请检查：(1) --scenario-catalog 是否提供且路径正确；"
+            "(2) 场景目录中是否有有效的 .sumocfg 文件；"
+            "(3) SUMO/TraCI 是否已安装。"
+            "如果只是想保存候选到 archive 进行分析，请使用 --archive-only 模式。"
+        )
+
     selector = SkillSelector(sumo_evaluator=sumo_evaluator)
 
     # ---- 6. 对每个路口运行进化 ----
@@ -288,6 +333,7 @@ def run_evolution(
             phase_count=inferred_phase_count,
             sql_profile=sql_profile,
             cohort=cohort,
+            feature_mask=feature_mask,
         )
 
         # 运行进化
@@ -316,6 +362,23 @@ def run_evolution(
                     if phase_best and phase_best.replay_report
                     else 0.0
                 ),
+                # 部署状态字段
+                "cycle_accepted_for_deployment": (
+                    cycle_best.accepted_for_deployment
+                    if cycle_best else False
+                ),
+                "phase_accepted_for_deployment": (
+                    phase_best.accepted_for_deployment
+                    if phase_best else False
+                ),
+                "cycle_has_real_sumo_report": (
+                    cycle_best.has_real_sumo_report
+                    if cycle_best else False
+                ),
+                "phase_has_real_sumo_report": (
+                    phase_best.has_real_sumo_report
+                    if phase_best else False
+                ),
             }
             results[crossing_id] = result_summary
 
@@ -333,12 +396,18 @@ def run_evolution(
             }
 
     # ---- 5. 保存 evolved cohort ----
-    evolved_cohort = _build_evolved_cohort(
-        cohort, archive, results
-    )
-    evolved_cohort_path = os.path.join(archive_dir, "evolved_cohort.json")
-    evolved_cohort.save(evolved_cohort_path)
-    print(f"\n[evolution] Evolved cohort 保存到: {evolved_cohort_path}")
+    if archive_only:
+        # archive-only 模式：不写 deployable evolved_cohort.json
+        print("\n[evolution] archive-only 模式，跳过 deployable evolved cohort 生成")
+        _save_archive_only_cohort(cohort, archive_dir, results)
+    else:
+        # 默认模式（require-sumo-for-champion）：只有 accepted_for_deployment=true 才写入
+        evolved_cohort = _build_evolved_cohort(
+            cohort, archive, results
+        )
+        evolved_cohort_path = os.path.join(archive_dir, "evolved_cohort.json")
+        evolved_cohort.save(evolved_cohort_path)
+        print(f"\n[evolution] Evolved cohort 保存到: {evolved_cohort_path}")
 
     # ---- 6. 保存摘要 ----
     summary_path = os.path.join(archive_dir, "evolution_summary.json")
@@ -369,18 +438,58 @@ def _infer_phase_count(code: str, default: int = 4) -> int:
     return default
 
 
+def _save_archive_only_cohort(
+    seed_cohort: SkillCohort,
+    archive_dir: str,
+    results: Dict,
+) -> None:
+    """archive-only 模式下保存一个引用 seed/incumbent 的 cohort 文件。
+
+    不要求 SUMO sealed evaluation，cohort 中所有 skill 都是 seed 回退。
+    写入 archive_evolved_cohort.json（带 source=archive_only 元数据），
+    不覆盖 evolved_cohort.json。
+    """
+    skills = {}
+    for crossing_id, result in results.items():
+        if crossing_id in seed_cohort.skills:
+            skills[crossing_id] = seed_cohort.skills[crossing_id]
+
+    cohort = SkillCohort(
+        cohort_id=f"archive_only_{seed_cohort.cohort_id}",
+        skills=skills,
+        frozen=True,
+        glm_used_online=False,
+        exploration=False,
+        created_by="run_evolution.py",
+        source="archive_only",
+        all_skills_accepted_for_deployment=False,
+    )
+    cohort_path = os.path.join(archive_dir, "archive_evolved_cohort.json")
+    cohort.save(cohort_path)
+    print(f"[evolution] archive-only cohort 保存到: {cohort_path}")
+
+
 def _build_evolved_cohort(
     seed_cohort: SkillCohort,
     archive: SkillArchive,
     results: Dict,
 ) -> SkillCohort:
-    """从进化结果构建 evolved cohort。"""
+    """从进化结果构建 evolved cohort。
+
+    只引用 accepted_for_deployment=true 的 Skill。
+    如果某个路口的 cycle 或 phase 没有 accepted_for_deployment=true 的候选，
+    则回退到 seed cohort 中对应的 skill。
+    如果没有任何路口有 accepted_for_deployment=true 的候选，
+    写入引用 seed/incumbent 的 cohort。
+    """
     evolved_skills = {}
+    all_accepted = True
 
     for crossing_id, result in results.items():
         if "error" in result:
             # 失败的路口使用 seed
             evolved_skills[crossing_id] = seed_cohort.skills[crossing_id]
+            all_accepted = False
             continue
 
         cycle_best_id = result.get("cycle_best_id")
@@ -389,9 +498,21 @@ def _build_evolved_cohort(
         cycle_entry = archive.get(cycle_best_id) if cycle_best_id else None
         phase_entry = archive.get(phase_best_id) if phase_best_id else None
 
-        # 构建 evolved skill 目录结构
-        cycle_dir = _save_evolved_skill(archive.archive_dir, crossing_id, "cycle", cycle_entry)
-        phase_dir = _save_evolved_skill(archive.archive_dir, crossing_id, "phase", phase_entry)
+        # 检查是否 accepted_for_deployment
+        cycle_accepted = (
+            cycle_entry is not None and cycle_entry.accepted_for_deployment
+        )
+        phase_accepted = (
+            phase_entry is not None and phase_entry.accepted_for_deployment
+        )
+
+        # 构建 evolved skill 目录结构（仅 accepted 的才保存为 evolved skill）
+        cycle_dir = _save_evolved_skill(
+            archive.archive_dir, crossing_id, "cycle", cycle_entry
+        ) if cycle_accepted else None
+        phase_dir = _save_evolved_skill(
+            archive.archive_dir, crossing_id, "phase", phase_entry
+        ) if phase_accepted else None
 
         if cycle_dir and phase_dir:
             evolved_skills[crossing_id] = {
@@ -401,13 +522,26 @@ def _build_evolved_cohort(
         else:
             # 降级使用 seed
             evolved_skills[crossing_id] = seed_cohort.skills[crossing_id]
+            all_accepted = False
+
+    # 确定 cohort source 标签
+    has_any_deployable = any(
+        result.get("cycle_accepted_for_deployment", False)
+        or result.get("phase_accepted_for_deployment", False)
+        for result in results.values()
+        if "error" not in result
+    )
+    cohort_source = "sealed_sumo_champion" if has_any_deployable else "seed_fallback"
 
     return SkillCohort(
         cohort_id=f"evolved_{seed_cohort.cohort_id}",
         skills=evolved_skills,
         frozen=True,
         glm_used_online=False,
+        exploration=False,
         created_by="run_evolution.py",
+        source=cohort_source,
+        all_skills_accepted_for_deployment=all_accepted,
     )
 
 
@@ -417,7 +551,10 @@ def _save_evolved_skill(
     skill_type: str,
     entry: Optional[ArchiveEntry],
 ) -> Optional[str]:
-    """将进化后的 skill 保存为标准 artifact 目录结构。"""
+    """将进化后的 skill 保存为标准 artifact 目录结构。
+
+    manifest 中包含完整的部署证据字段，来自 ArchiveEntry 的部署状态硬字段。
+    """
     if entry is None or not entry.code:
         return None
 
@@ -432,7 +569,7 @@ def _save_evolved_skill(
     # 保存 skill.py
     (artifact_dir / "skill.py").write_text(entry.code, encoding="utf-8")
 
-    # 创建 manifest
+    # 创建 manifest：包含部署证据字段
     code_hash = SkillArtifact.compute_code_hash(entry.code)
     artifact = SkillArtifact(
         skill_id=f"tls_{crossing_id}_{skill_type}_v{version:04d}",
@@ -450,10 +587,26 @@ def _save_evolved_skill(
         constraints_profile="default",
         metrics=SkillMetrics(
             replay_score=entry.replay_report.get("score", 0.0) if entry.replay_report else 0.0,
+            sumo_score=entry.sumo_report.get("score", 0.0) if entry.sumo_report else 0.0,
         ),
     )
+
+    # 将 manifest 转为 dict 后注入部署证据字段
+    manifest_dict = artifact.to_dict()
+    manifest_dict.update({
+        # 部署状态硬字段（来自 ArchiveEntry）
+        "is_archive_candidate": entry.is_archive_candidate,
+        "is_deployable_champion": entry.is_deployable_champion,
+        "has_real_sumo_report": entry.has_real_sumo_report,
+        "paired_eval_passed": entry.paired_eval_passed,
+        "accepted_for_deployment": entry.accepted_for_deployment,
+        "incumbent_skill_id": entry.incumbent_skill_id,
+        "rejection_reason": entry.deployment_rejection_reason or entry.rejection_reason or "",
+    })
+
     (artifact_dir / "manifest.json").write_text(
-        artifact.to_json(), encoding="utf-8"
+        json.dumps(manifest_dict, indent=2, ensure_ascii=False),
+        encoding="utf-8",
     )
 
     return str(artifact_dir.resolve())
@@ -519,6 +672,21 @@ def main():
         default=None,
         help="场景目录 JSON 路径（用于多场景评估）",
     )
+    deploy_group = parser.add_mutually_exclusive_group()
+    deploy_group.add_argument(
+        "--archive-only",
+        action="store_true",
+        default=False,
+        help="archive-only 模式：不需要 SUMO 评估，只保存候选到 archive，"
+             "不写 deployable evolved_cohort.json",
+    )
+    deploy_group.add_argument(
+        "--require-sumo-for-champion",
+        action="store_true",
+        default=True,
+        help="默认模式：必须有 SUMO sealed evaluation 才能写 evolved_cohort.json。"
+             "此参数为默认行为，无需显式指定。",
+    )
 
     args = parser.parse_args()
 
@@ -533,6 +701,7 @@ def main():
         crossing_filter=args.crossing,
         sql_profile_path=args.sql_profile,
         scenario_catalog_path=args.scenario_catalog,
+        archive_only=args.archive_only,
     )
 
 

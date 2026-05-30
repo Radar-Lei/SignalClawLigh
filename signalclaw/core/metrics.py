@@ -26,6 +26,8 @@ class SimulationMetrics:
     # TripInfoCollector 计算的时间加权平均 queue（真实数据，每步每 lane halting 的时间平均）
     # 优先级高于 step_metrics 中的采样平均。
     _collector_avg_queue: Optional[float] = field(default=None, repr=False)
+    # OnlineController 统计日志（仅 OnlineController 方法有值）
+    controller_stats: Optional[dict] = None
 
     def add_step(self, m: StepMetrics):
         if m.tls_id not in self.step_metrics:

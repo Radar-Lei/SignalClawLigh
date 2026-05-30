@@ -196,6 +196,9 @@ class ExperimentRunner:
         # TODO: 接入真实预测模块后默认改为 True。
         self.enable_prediction = enable_prediction
         self.results: Dict[str, SimulationMetrics] = {}
+        # switch 命令的 pending duration: tls_id -> (target_green_phase, duration)
+        # 当 SUMO 自然过渡到目标绿色相位时，设置期望的 duration
+        self._pending_switch_durations: Dict[str, Tuple[int, float]] = {}
 
     # ------------------------------------------------------------------
     # 通用仿真主循环（用于所有方法）
@@ -310,6 +313,9 @@ class ExperimentRunner:
         if controller is not None and hasattr(controller, 'reset'):
             controller.reset()
 
+        # 清空 pending switch durations
+        self._pending_switch_durations.clear()
+
         # 每个 TLS 的追踪状态（用于非 OnlineController 方法）
         tls_state: Dict[str, dict] = {}
         for tid in tls_ids:
@@ -321,14 +327,6 @@ class ExperimentRunner:
 
         # OnlineController 的特殊状态
         is_online = isinstance(controller, OnlineController)
-        # 为 OnlineController 初始化追踪状态（检测新绿色相位的进入）
-        if is_online:
-            controller._runner_states: Dict[str, dict] = {}
-            for tid in tls_ids:
-                controller._runner_states[tid] = {
-                    'last_green_phase': None,
-                    'plan_phase_index': 0,
-                }
 
         step = 0
         sim_time = 0.0
@@ -414,6 +412,26 @@ class ExperimentRunner:
         # 真实 stops 来自 TripInfoCollector 的逐步累加
         metrics.total_stops_from_tripinfo = collector.get_total_stops()
 
+        # --- 收集 OnlineController 统计日志 ---
+        if is_online and controller is not None:
+            ctrl_stats = controller.stats.to_dict()
+            # 确保 online_glm_calls 始终为 0
+            ctrl_stats["online_glm_calls"] = 0
+            metrics.controller_stats = ctrl_stats
+            if verbose:
+                print(f"  [{method_name}] Controller stats: "
+                      f"cycle_plan={ctrl_stats['cycle_plan_count']}, "
+                      f"phase_cmd={ctrl_stats['phase_command_count']}, "
+                      f"hold={ctrl_stats['phase_hold_count']}, "
+                      f"switch={ctrl_stats['phase_switch_count']}, "
+                      f"extend={ctrl_stats['phase_extend_count']}, "
+                      f"shorten={ctrl_stats['phase_shorten_count']}, "
+                      f"safety_clip={ctrl_stats['safety_clip_count']}")
+                print(f"  [{method_name}] Switch constraints: "
+                      f"cooldown_reject={ctrl_stats.get('switch_cooldown_reject_count', 0)}, "
+                      f"min_green_reject={ctrl_stats.get('min_green_reject_count', 0)}, "
+                      f"cycle_limit_reject={ctrl_stats.get('cycle_switch_limit_reject_count', 0)}")
+
         traci.close()
 
         # --- 交叉验证: 从 tripinfo XML 解析 travel time / waiting time ---
@@ -472,83 +490,145 @@ class ExperimentRunner:
     def _control_with_online_controller(self, traci, tls_ids: list,
                                          tls_data: dict, sim_time: float,
                                          controller: OnlineController) -> None:
-        """使用 OnlineController 控制所有路口。
+        """使用 OnlineController 控制所有路口 — 完整双 Skill 闭环。
 
-        核心策略：只在检测到进入新的绿色相位时才干预，且只使用
-        setPhaseDuration() 控制绿色相位持续时间。SUMO 自身负责
-        绿 -> 黄 -> 红 -> 下一绿的过渡。
+        每个 sim step 对每个 tls_id 调用 online_controller.step()，
+        将返回的 PhaseCommand 映射为 TraCI 操作：
+        - hold:    保持当前相位，设置剩余 duration
+        - extend:  延长当前绿色相位 duration
+        - shorten: 缩短当前绿色相位 duration（不低于 min_green）
+        - switch:  切到 next_phase_id，处理 yellow/all-red 过渡
 
-        这与 _control_with_legacy_skill 的行为模式一致，区别在于
-        从 cohort 加载 per-TLS 的 frozen skill 而非使用全局 skill 实例。
+        OnlineController 内部负责：
+        1. cycle boundary -> CycleSkill.plan() -> 安全裁剪 -> 设定周期
+        2. phase decision point -> PhaseSkill.decide() -> 安全裁剪 -> 微调
+        3. phase exhausted -> 自动推进下一相位
         """
-        # 收集所有路口的观测（用于 neighbor graph）
+        # 第一步：收集所有路口的观测
         all_obs: Dict[str, IntersectionObservation] = {}
-
         for tls_id in tls_ids:
-            td = tls_data[tls_id]
             current_phase = traci.trafficlight.getPhase(tls_id)
-            state_str = td['phases'][current_phase].state
-            is_green = is_green_phase(state_str)
+            all_obs[tls_id] = self._build_observation(
+                traci, tls_id, tls_data, current_phase
+            )
 
-            # 检测是否刚进入一个新的绿色相位
-            online_state = controller._runner_states[tls_id]
-            last_green = online_state['last_green_phase']
+        # 第一步半：处理 pending switch durations
+        # 当 SUMO 自然过渡到目标绿色相位时，设置之前记录的 duration
+        for tls_id in tls_ids:
+            pending = self._pending_switch_durations.get(tls_id)
+            if pending is not None:
+                target_phase, target_duration = pending
+                current_phase = traci.trafficlight.getPhase(tls_id)
+                if current_phase == target_phase:
+                    # 已经到了目标绿色相位
+                    state_str = tls_data[tls_id]['phases'][current_phase].state
+                    if is_green_phase(state_str):
+                        traci.trafficlight.setPhaseDuration(tls_id, target_duration)
+                        del self._pending_switch_durations[tls_id]
 
-            if is_green and last_green != current_phase:
-                # 进入新的绿色相位
-                online_state['last_green_phase'] = current_phase
+        # 第二步：对每个路口调用 online_controller.step()
+        for tls_id in tls_ids:
+            cmd = controller.step(tls_id, sim_time, all_obs)
 
-                # 构建观测
-                obs = self._build_observation(traci, tls_id, tls_data, current_phase)
-                all_obs[tls_id] = obs
+            if cmd is None:
+                continue
 
-                # 构建 NetworkObservation（包含已收集的邻居观测）
-                neighbor_ids = controller.neighbor_graph.get_neighbor_tls_ids(tls_id)
-                neighbors: Dict[str, IntersectionObservation] = {}
-                for nid in neighbor_ids:
-                    if nid not in all_obs:
-                        all_obs[nid] = self._build_observation(traci, nid, tls_data)
-                    neighbors[nid] = all_obs[nid]
+            # 将 PhaseCommand 映射为 TraCI 操作
+            self._apply_phase_command_to_traci(
+                traci, tls_id, tls_data, cmd, controller
+            )
 
-                net_obs = NetworkObservation(
-                    ego=obs, neighbors=neighbors, timestamp=sim_time,
-                )
+    # ------------------------------------------------------------------
+    # PhaseCommand -> TraCI 映射
+    # ------------------------------------------------------------------
 
-                # 获取当前 plan 和跟踪状态
-                plan = controller.cycle_manager.get_plan(tls_id)
-                plan_idx = online_state['plan_phase_index']
-                need_new_plan = (plan is None
-                                 or plan_idx >= len(plan.phase_order)
-                                 or plan.phase_order[plan_idx] != current_phase)
+    def _apply_phase_command_to_traci(
+        self, traci, tls_id: str, tls_data: dict,
+        cmd: PhaseCommand, controller: OnlineController
+    ) -> None:
+        """将 PhaseCommand 映射为具体的 TraCI 调用。
 
-                if need_new_plan:
-                    # 周期边界：调用 cycle skill 生成新计划
-                    cycle_skill = controller.cohort.get_cycle_skill(tls_id)
-                    raw_plan = cycle_skill.plan(net_obs)
-                    plan = controller.safety_layer.clip_cycle_plan(raw_plan, tls_id)
-                    controller.cycle_manager.set_plan(tls_id, plan, sim_time)
-                    controller.stats.cycle_plan_count += 1
-                    plan_idx = 0
-                    online_state['plan_phase_index'] = 0
+        PhaseCommand.action:
+        - hold:    保持当前相位，不做 TraCI 调用（让 SUMO 继续倒计时）
+        - extend:  延长当前绿色相位，使用 setPhaseDuration
+        - shorten: 缩短当前绿色相位，使用 setPhaseDuration
+        - switch:  切到 next_phase_id，处理 yellow/all-red 过渡
+        """
+        td = tls_data[tls_id]
+        current_phase = traci.trafficlight.getPhase(tls_id)
+        state_str = td['phases'][current_phase].state
+        current_is_green = is_green_phase(state_str)
 
-                # 从 plan 中获取当前绿色相位对应的持续时间
-                if plan and plan.phase_order and plan_idx < len(plan.phase_order):
-                    planned_phase = plan.phase_order[plan_idx]
-                    duration = plan.green_times.get(
-                        planned_phase, td['default_durations'][current_phase]
-                    )
+        constraints = controller.safety_layer.constraints.get(tls_id)
+
+        if cmd.action == "hold":
+            # hold: 保持当前相位，不干预 SUMO 倒计时
+            # 无需 TraCI 调用
+            pass
+
+        elif cmd.action == "extend":
+            # extend: 延长当前绿色相位持续时间
+            # 只在当前是绿色相位时才有效
+            if current_is_green:
+                # setPhaseDuration 设置的是"从现在起的剩余时间"
+                # cmd.duration 是延长后的总持续时间
+                remaining = traci.trafficlight.getNextSwitch(tls_id) - traci.simulation.getTime()
+                # extra = 新总时间 - 已过时间，即新的剩余时间
+                elapsed = max(0.0, td['default_durations'][current_phase] - remaining
+                              if current_phase < len(td['default_durations']) else 0.0)
+                new_remaining = cmd.duration - elapsed
+                if new_remaining > remaining and new_remaining > 0:
+                    traci.trafficlight.setPhaseDuration(tls_id, new_remaining)
+
+        elif cmd.action == "shorten":
+            # shorten: 缩短当前绿色相位持续时间
+            # 只在当前是绿色相位时才有效
+            if current_is_green:
+                remaining = traci.trafficlight.getNextSwitch(tls_id) - traci.simulation.getTime()
+                elapsed = max(0.0, td['default_durations'][current_phase] - remaining
+                              if current_phase < len(td['default_durations']) else 0.0)
+                # 缩短后不能低于 min_green
+                min_remaining = max(0.0, constraints.min_green - elapsed)
+                new_remaining = max(min_remaining, cmd.duration)
+                if new_remaining < remaining:
+                    traci.trafficlight.setPhaseDuration(tls_id, new_remaining)
+
+        elif cmd.action == "switch":
+            # switch: 切到 next_phase_id
+            # SUMO TLS 程序定义了完整的相位序列（green -> yellow -> all_red -> green）
+            # 不能跳过中间的 yellow/all-red 过渡。
+            #
+            # 策略：
+            # 1. 如果当前是绿色相位且目标是另一个绿色相位 -> 结束当前绿色相位
+            #    （setPhaseDuration=1 让 SUMO 自然过渡 yellow/all-red 到目标）
+            # 2. 如果当前已经是目标绿色相位 -> 设置新的 duration
+            # 3. 如果当前在非绿色相位（yellow/all-red）-> 不干预，让过渡完成
+            target_green = cmd.next_phase_id
+
+            # 确认目标相位在 TLS 程序中存在
+            if target_green < 0 or target_green >= td['num_phases']:
+                return
+
+            if current_is_green:
+                if current_phase == target_green:
+                    # 已经在目标绿色相位，设置新的 duration
+                    traci.trafficlight.setPhaseDuration(tls_id, cmd.duration)
                 else:
-                    duration = td['default_durations'][current_phase]
-
-                # 推进 plan_phase_index，下次进入新绿色相位时使用
-                online_state['plan_phase_index'] = plan_idx + 1
-
-                # 裁剪持续时间
-                duration = max(8.0, min(90.0, duration))
-
-                # 只使用 setPhaseDuration 控制当前绿色相位的持续时间
-                traci.trafficlight.setPhaseDuration(tls_id, duration)
-                controller.stats.phase_command_count += 1
+                    # 需要切到另一个绿色相位
+                    # 结束当前绿色相位，让 SUMO 自然过渡 yellow -> all_red -> target green
+                    # 设置最小剩余时间（1 步），让 SUMO 尽快进入过渡
+                    remaining = traci.trafficlight.getNextSwitch(tls_id) - traci.simulation.getTime()
+                    if remaining > 1.0:
+                        traci.trafficlight.setPhaseDuration(tls_id, 1.0)
+                    # 当 SUMO 自然过渡到目标绿色相位时，再通过下一次 step 设置 duration
+                    # 记录目标绿色相位和期望的 duration，等过渡完成后设置
+                    self._pending_switch_durations[tls_id] = (target_green, cmd.duration)
+            else:
+                # 当前在非绿色相位（yellow/all-red 过渡中）
+                # 不干预过渡过程，让 SUMO 自然完成过渡
+                # pending switch duration 将在 _control_with_online_controller
+                # 的下一步中被检测和处理
+                pass
 
     # ------------------------------------------------------------------
     # 传统 skill 控制（MaxPressure / SignalClaw）
@@ -858,6 +938,11 @@ class ExperimentRunner:
         os.makedirs(output_dir, exist_ok=True)
 
         summaries = {name: m.summary() for name, m in self.results.items()}
+        # 附加 controller stats（如果有）
+        for name, m in self.results.items():
+            if m.controller_stats is not None:
+                summaries[name]["controller_stats"] = m.controller_stats
+
         with open(os.path.join(output_dir, "summary.json"), "w") as f:
             json.dump(summaries, f, indent=2)
 

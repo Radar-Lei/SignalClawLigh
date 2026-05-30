@@ -2,6 +2,7 @@
 
 所有 prompt 模板集中在此模块管理，确保 GLM 生成的代码满足安全约束。
 支持注入 SQL 参考画像信息作为先验提示，帮助 GLM 生成更贴近真实交通的代码。
+支持 Feature Mask 门控，在 prompt 中明确告知 GLM 哪些特征不可用。
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from signalclaw.reference.profile_schema import SQLReferenceProfile
+
+from signalclaw.evolution.feature_mask import FeatureMask
 
 
 class PromptBuilder:
@@ -20,16 +23,23 @@ class PromptBuilder:
     sql_profile : SQLReferenceProfile, optional
         SQL 参考画像，包含真实交通系统的统计先验。
         如果提供，会在 prompt 中注入先验信息供 GLM 参考。
+    feature_mask : FeatureMask, optional
+        特征可用性门控。如果提供，会在 prompt 中注入不可用特征信息。
     """
 
-    def __init__(self, sql_profile: Optional["SQLReferenceProfile"] = None):
+    def __init__(
+        self,
+        sql_profile: Optional["SQLReferenceProfile"] = None,
+        feature_mask: Optional[FeatureMask] = None,
+    ):
         self.sql_profile = sql_profile
+        self.feature_mask = feature_mask or FeatureMask()
 
     # ======================================================================
-    # System prompt 模板
+    # System prompt 模板（会在 build_*_prompt 中根据 feature_mask 动态调整）
     # ======================================================================
 
-    SYSTEM_PROMPT_CYCLE = (
+    _BASE_SYSTEM_PROMPT_CYCLE = (
         "你是一个交通信号控制算法专家。你的任务是改进一个交叉口的周期规划算法（CyclePlannerSkill）。\n"
         "\n"
         "## 你的任务\n"
@@ -44,7 +54,6 @@ class PromptBuilder:
         "        - obs.ego.phases: Dict[int, PhaseObservation]（各相位状态）\n"
         "          - phase_obs.queue: float（排队车辆数）\n"
         "          - phase_obs.waiting_time: float（平均等待时间，秒）\n"
-        "          - phase_obs.predicted_arrival: float（预测到达车辆数）\n"
         "          - phase_obs.elapsed_green: float（已运行绿灯时间）\n"
         "          - phase_obs.min_green: float（最小绿灯时间）\n"
         "          - phase_obs.max_green: float（最大绿灯时间）\n"
@@ -72,13 +81,14 @@ class PromptBuilder:
         "11. 不能使用类（class），不能使用全局可变状态\n"
         "12. 所有变量必须初始化后才能使用\n"
         "13. 不能使用 try/except\n"
+        "{feature_mask_rules}"
         "\n"
         "## 输出格式\n"
         "请严格按以下 JSON 格式输出（不要输出其他内容）：\n"
         '{"rationale": "简要说明你的改进思路（1-3 句话）", "expected_effect": "预期效果", "risk": "可能的副作用或风险", "code": "完整的 plan() 函数代码（包含所有辅助函数）"}\n'
     )
 
-    SYSTEM_PROMPT_PHASE = (
+    _BASE_SYSTEM_PROMPT_PHASE = (
         "你是一个交通信号控制算法专家。你的任务是改进一个交叉口的相位微调算法（PhaseMicroSkill）。\n"
         "\n"
         "## 你的任务\n"
@@ -111,6 +121,7 @@ class PromptBuilder:
         "11. 不能使用类（class），不能使用全局可变状态\n"
         "12. 所有变量必须初始化后才能使用\n"
         "13. 不能使用 try/except\n"
+        "{feature_mask_rules}"
         "\n"
         "## 输出格式\n"
         "请严格按以下 JSON 格式输出（不要输出其他内容）：\n"
@@ -202,7 +213,12 @@ class PromptBuilder:
 
         user_prompt += f"\n请严格按 JSON 格式输出。\n"
 
-        return self.SYSTEM_PROMPT_CYCLE, user_prompt
+        # 注入 Feature Mask 规则到 system prompt
+        system_prompt = self._build_system_prompt_with_mask(
+            self._BASE_SYSTEM_PROMPT_CYCLE
+        )
+
+        return system_prompt, user_prompt
 
     def build_phase_prompt(
         self,
@@ -294,11 +310,52 @@ class PromptBuilder:
 
         user_prompt += f"\n请严格按 JSON 格式输出。\n"
 
-        return self.SYSTEM_PROMPT_PHASE, user_prompt
+        # 注入 Feature Mask 规则到 system prompt
+        system_prompt = self._build_system_prompt_with_mask(
+            self._BASE_SYSTEM_PROMPT_PHASE
+        )
+
+        return system_prompt, user_prompt
 
     # ======================================================================
     # Internal helpers
     # ======================================================================
+
+    def _build_system_prompt_with_mask(self, base_prompt: str) -> str:
+        """根据 feature_mask 动态生成 system prompt。
+
+        如果有不可用的特征，在 prompt 中添加明确的禁止规则。
+        """
+        disabled = self.feature_mask.get_disabled_feature_names()
+        if not disabled:
+            # 没有不可用特征，不需要额外规则
+            return base_prompt.replace("{feature_mask_rules}", "")
+
+        # 构建不可用特征规则
+        rules_lines = [
+            "",
+            "## 特征可用性约束（极其重要）",
+            "以下特征当前**不可用**，你的代码中**严禁使用**：",
+        ]
+        for feat in disabled:
+            if feat == "predicted_arrival":
+                rules_lines.append(
+                    f"  - {feat}: 预测到达车辆数（预测模块未接入，值恒为 0.0）"
+                )
+            else:
+                rules_lines.append(f"  - {feat}")
+
+        rules_lines.extend([
+            "",
+            "具体要求：",
+            "  - 不要在你的代码中访问上述特征（如 .predicted_arrival）",
+            "  - 不要使用与上述特征相关的参数权重（如 w_arrival）",
+            "  - 不要在注释或变量名中引用上述特征",
+            "  - 违反此规则的代码将被直接拒绝",
+        ])
+
+        feature_mask_rules = "\n".join(rules_lines)
+        return base_prompt.replace("{feature_mask_rules}", feature_mask_rules)
 
     def _format_failure_cases(self, failure_cases: list) -> str:
         """将失败案例格式化为可读文本。"""
