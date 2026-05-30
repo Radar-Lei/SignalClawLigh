@@ -14,6 +14,8 @@ import sys
 import json
 import csv
 import time
+import tempfile
+import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 
@@ -95,12 +97,20 @@ class ExperimentRunner:
 
         metrics = SimulationMetrics(method_name=method_name)
 
-        # 启动 SUMO
+        # 创建 tripinfo 临时文件
+        tripinfo_file = tempfile.NamedTemporaryFile(
+            suffix=".xml", prefix="tripinfo_", delete=False
+        )
+        tripinfo_path = tripinfo_file.name
+        tripinfo_file.close()
+
+        # 启动 SUMO（启用 tripinfo 输出以获取真实 travel time / waiting time / stops）
         cmd = ["sumo", "-c", self.sumocfg_path,
                "--seed", str(self.seed),
                "--step-length", str(self.step_length),
                "--no-warnings", "--no-step-log",
-               "--time-to-teleport", "-1"]
+               "--time-to-teleport", "-1",
+               "--tripinfo-output", tripinfo_path]
 
         traci.start(cmd)
 
@@ -152,9 +162,12 @@ class ExperimentRunner:
         if verbose:
             print(f"  [{method_name}] Found {len(tls_ids)} traffic lights")
 
-        # 车辆跟踪
+        # 车辆跟踪（保留作为 tripinfo 不可用时的 fallback）
         vehicle_depart: Dict[str, float] = {}
         vehicle_arrived: List[float] = []
+
+        # 累计到达车辆数（用于计算每步 throughput 差值）
+        last_arrived_count = 0
 
         # 初始化控制器
         if controller is not None and hasattr(controller, 'reset'):
@@ -189,7 +202,7 @@ class ExperimentRunner:
             step += 1
             sim_time = traci.simulation.getTime()
 
-            # 车辆跟踪
+            # 车辆跟踪（fallback，优先使用 tripinfo）
             for veh_id in traci.simulation.getDepartedIDList():
                 vehicle_depart[veh_id] = sim_time
             for veh_id in traci.simulation.getArrivedIDList():
@@ -233,15 +246,18 @@ class ExperimentRunner:
                             except traci.exceptions.TraCIException:
                                 pass
 
-                arrived_this_step = len(traci.simulation.getArrivedIDList())
+                # 使用累计到达数差值计算区间 throughput（统一口径）
+                current_arrived_count = traci.simulation.getArrivedNumber()
+                throughput_delta = current_arrived_count - last_arrived_count
+                last_arrived_count = current_arrived_count
 
                 metrics.add_step(StepMetrics(
                     tls_id="ALL", step=step, sim_time=sim_time,
                     phase_id=0, queue_total=total_queue,
                     waiting_time_avg=total_wait / max(n_lanes, 1),
-                    throughput=arrived_this_step,
+                    throughput=throughput_delta,
                     delay_total=total_wait,
-                    stops=int(total_queue * 0.3),
+                    stops=0,  # stops 将在仿真结束后从 tripinfo 获取
                 ))
 
             if verbose and step % 600 == 0:
@@ -251,14 +267,60 @@ class ExperimentRunner:
                 print(f"  [{method_name}] Step {step}, time={sim_time:.0f}s, queue={q:.0f}")
 
         metrics.travel_times = vehicle_arrived
+        metrics.total_sim_time = sim_time
         traci.close()
+
+        # --- 从 tripinfo 解析真实指标 ---
+        tripinfo_travel_times: List[float] = []
+        tripinfo_waiting_times: List[float] = []
+        tripinfo_stops_total = 0
+
+        try:
+            tree = ET.parse(tripinfo_path)
+            root = tree.getroot()
+            for trip in root.findall('tripinfo'):
+                # travel time
+                tt = trip.get('duration')
+                if tt is not None:
+                    tripinfo_travel_times.append(float(tt))
+                # waiting time
+                wt = trip.get('waitingTime')
+                if wt is not None:
+                    tripinfo_waiting_times.append(float(wt))
+                # stops
+                # tripinfo 中每个 trip 可以有 <stop> 子元素，也可以从 stopTime 属性统计
+                stop_children = trip.findall('stop')
+                tripinfo_stops_total += len(stop_children)
+
+            if tripinfo_travel_times:
+                metrics.travel_times = tripinfo_travel_times
+                metrics.waiting_times = tripinfo_waiting_times
+                metrics.total_stops_from_tripinfo = tripinfo_stops_total
+
+            if verbose:
+                src = "tripinfo" if tripinfo_travel_times else "fallback"
+                print(f"  [{method_name}] Metrics source: {src} "
+                      f"({len(tripinfo_travel_times)} trips parsed)")
+        except (ET.ParseError, FileNotFoundError) as e:
+            if verbose:
+                print(f"  [{method_name}] tripinfo parse failed ({e}), using fallback metrics")
+        finally:
+            # 清理临时文件
+            try:
+                os.unlink(tripinfo_path)
+            except OSError:
+                pass
 
         if verbose:
             summary = metrics.summary()
+            stops_str = (str(summary['total_stops'])
+                         if summary['total_stops'] is not None else "N/A")
             print(f"  [{method_name}] Completed: {summary['completed_vehicles']} vehicles, "
                   f"avg_travel={summary['avg_travel_time']:.1f}s, "
                   f"avg_queue={summary['avg_queue']:.1f}, "
-                  f"avg_wait={summary['avg_waiting_time']:.1f}s")
+                  f"avg_wait={summary['avg_waiting_time']:.1f}s "
+                  f"(src={summary['waiting_time_source']}), "
+                  f"stops={stops_str} (src={summary['stops_source']})")
 
         return metrics
 
@@ -589,12 +651,20 @@ class ExperimentRunner:
                 v = summaries.get(name, {}).get(key, 0)
                 vals.append(v)
 
-            best_idx = vals.index(max(vals) if higher_better else min(vals))
+            # 跳过全部为 None 的指标
+            if all(v is None for v in vals):
+                continue
+
+            # 在比较时将 None 视为最差值
+            comparable_vals = [v if v is not None else (float('inf') if not higher_better else float('-inf')) for v in vals]
+            best_idx = comparable_vals.index(max(comparable_vals) if higher_better else min(comparable_vals))
 
             line = f"{label:<30}"
             for i, v in enumerate(vals):
                 marker = " *" if i == best_idx else "  "
-                if isinstance(v, float):
+                if v is None:
+                    line += f"{'N/A':>12}{marker}"
+                elif isinstance(v, float):
                     line += f"{v:>12.1f}{marker}"
                 else:
                     line += f"{v:>12}{marker}"
@@ -617,13 +687,14 @@ class ExperimentRunner:
                     for label, key, higher_better in metrics_list:
                         sc_v = sc.get(key, 0)
                         bl_v = bl.get(key, 0)
-                        if bl_v != 0:
-                            pct = (sc_v - bl_v) / abs(bl_v) * 100
-                            if higher_better:
-                                better = "BETTER" if pct > 0 else "worse"
-                            else:
-                                better = "BETTER" if pct < 0 else "worse"
-                            print(f"  {label:<30}: {pct:+.1f}% ({better})")
+                        if sc_v is None or bl_v is None or bl_v == 0:
+                            continue
+                        pct = (sc_v - bl_v) / abs(bl_v) * 100
+                        if higher_better:
+                            better = "BETTER" if pct > 0 else "worse"
+                        else:
+                            better = "BETTER" if pct < 0 else "worse"
+                        print(f"  {label:<30}: {pct:+.1f}% ({better})")
 
     def save_results(self, output_dir: str = "results"):
         """保存结果到文件。"""
