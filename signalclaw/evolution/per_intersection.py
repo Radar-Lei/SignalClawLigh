@@ -605,6 +605,7 @@ class PerIntersectionEvolver:
             NetworkObservation,
             IntersectionObservation,
             PhaseObservation,
+            PhaseCommand,
         )
 
         # 构造一个标准测试场景

@@ -446,7 +446,7 @@ class SUMOEvaluator:
         # 累积指标
         step_waiting_times: List[float] = []
         step_queue_lengths: List[float] = []
-        step_throughputs: List[float] = []
+        # step_throughputs removed (INFO-01): was unused
         max_queue = 0.0
         safety_overrides = 0
         phase_starvation_count = 0
@@ -543,29 +543,39 @@ class SUMOEvaluator:
             # ---- 计算汇总指标 ----
             n_valid = max(len(step_waiting_times), 1)
 
+            # BLOCKER-01: throughput 用 avg_per_step 而不是 sum，避免重复计数
+            avg_throughput_per_step = (
+                sum(throughput_window) / max(len(throughput_window), 1)
+                if throughput_window else 0.0
+            )
+
+            # BLOCKER-02: effective_steps 排除 warmup 阶段
+            effective_steps = max(total_steps - self.warmup_steps, 1)
+
+            # BLOCKER-03: _count_phase_starvation 只调用一次，结果复用
+            phase_starvation_count = self._count_phase_starvation(
+                phase_appearances, effective_steps
+            )
+
             metrics = {
                 "mean_waiting": sum(step_waiting_times) / n_valid if step_waiting_times else 0.0,
                 "mean_queue": sum(step_queue_lengths) / n_valid if step_queue_lengths else 0.0,
                 "max_queue": max_queue,
-                "throughput": sum(throughput_window),
-                "intersection_throughput": sum(throughput_window),
+                "throughput": avg_throughput_per_step,
+                "intersection_throughput": avg_throughput_per_step,
                 "completed_vehicles": sum(arrived_window),
-                "avg_throughput_per_step": sum(throughput_window) / max(len(throughput_window), 1),
+                "avg_throughput_per_step": avg_throughput_per_step,
                 "safety_overrides": float(total_safety_clips),
                 "total_steps": float(total_steps),
                 "sim_duration": sim_time,
                 # 相位饥饿：如果有相位几乎没出现过
-                "phase_starvation_count": self._count_phase_starvation(
-                    phase_appearances, total_steps - self.warmup_steps
-                ),
+                "phase_starvation_count": phase_starvation_count,
                 # 溢出事件：下游排队过高的步数占比
                 "spillback_events": self._count_spillback_from_obs(adapter, crossing_id),
-                # 安全覆写比
-                "safety_override_ratio": total_safety_clips / max(total_steps, 1),
+                # 安全覆写比（分母排除 warmup）
+                "safety_override_ratio": total_safety_clips / effective_steps,
                 # 相位饥饿比
-                "phase_starvation_ratio": self._count_phase_starvation(
-                    phase_appearances, total_steps - self.warmup_steps
-                ) / max(len(phase_appearances), 1),
+                "phase_starvation_ratio": phase_starvation_count / max(len(phase_appearances), 1),
                 # 溢出比
                 "spillback_ratio": 0.0,  # 需要从步骤数据计算
             }

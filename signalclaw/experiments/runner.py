@@ -32,7 +32,7 @@ from signalclaw.skills.signalclaw_skill import SignalClawSkill
 from signalclaw.skills.cohort import SkillCohort
 from signalclaw.network.neighbor_graph import NeighborGraph
 from signalclaw.execution.online_controller import OnlineController
-from signalclaw.execution.phase_command_executor import PhaseCommandExecutor
+from signalclaw.execution.phase_command_executor import PhaseCommandExecutor, is_green_phase
 
 
 # ======================================================================
@@ -152,13 +152,6 @@ class TripInfoCollector:
 # ======================================================================
 # 辅助函数
 # ======================================================================
-
-def is_green_phase(state_str: str) -> bool:
-    """检查 phase state 字符串是否表示绿灯相位（有 g/G 但没有 y）。"""
-    has_green = any(c in 'gG' for c in state_str)
-    has_yellow = any(c in 'y' for c in state_str)
-    return has_green and not has_yellow
-
 
 def find_yellow_phase_before(td: dict, green_phase_idx: int) -> Optional[int]:
     """查找给定绿灯相位之前的黄灯/全红相位索引。
