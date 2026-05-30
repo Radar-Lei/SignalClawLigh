@@ -227,24 +227,72 @@ class MaxPressureCanonical(_MaxPressureBase):
 
     * Min-green: the current phase must have been active for at least
       ``min_green`` seconds before a switch is allowed.
-    * Pressure is computed per-movement (upstream_queue edge minus the
-      matching downstream_queue edge).
+    * Pressure is computed per-movement: for each upstream edge that belongs to
+      the given phase, we find the matching downstream edge(s) via a configurable
+      mapping (``_phase_downstream_mapping``).  Without a mapping we fall back to
+      a heuristic edge-name matching or a per-edge average.
     * plan() still returns a CyclePlan so it fits the skill_api protocol,
       but decide() is free to switch to any phase — it is not bound to
       the phase_order in the plan.
+
+    Movement-level vs edge-average pressure
+    ----------------------------------------
+    True MaxPressure (Varaiya 2013) computes pressure as the sum over all
+    *movements* (turning directions) served by a phase:
+
+        pressure(phase) = sum_{m in movements(phase)} ( upstream(m) - downstream(m) )
+
+    where upstream(m) is the queue on the incoming approach lane-group for
+    movement m, and downstream(m) is the queue on the outgoing link that
+    movement m feeds into.  This is **movement-level** because each phase's
+    outgoing pressure only counts the downstream edges that are *actually
+    reachable* from that phase's incoming edges.
+
+    A simpler approximation (edge-average) takes the average of *all*
+    downstream edges and uses the same value for every phase.  This loses
+    phase-specific downstream information and may bias phases whose outgoing
+    links happen to be congested.
     """
 
     # map to remember how long the current phase has been active
     _phase_elapsed: Dict[str, float]  # tls_id -> elapsed seconds
 
-    def __init__(self, **kwargs):
+    # Optional: phase_id -> list of downstream edge names that this phase feeds into.
+    # When provided, compute_pressure uses exact movement-level calculation.
+    # When None, a heuristic edge-key matching is attempted first; if that
+    # also fails, falls back to per-edge average with a TODO note.
+    _phase_downstream_mapping: Optional[Dict[int, List[str]]]
+
+    def __init__(
+        self,
+        phase_downstream_mapping: Optional[Dict[int, List[str]]] = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._phase_elapsed: Dict[str, float] = {}
+        self._phase_downstream_mapping = phase_downstream_mapping
 
     # ---- pressure ----
 
     def compute_pressure(self, obs: IntersectionObservation, phase_id: int) -> float:
-        """Movement-specific pressure: upstream - downstream per movement edge."""
+        """Movement-level pressure: upstream - downstream per movement edge.
+
+        计算 logic 按优先级分为三级：
+
+        1. **精确映射**：如果构造时提供了 ``_phase_downstream_mapping``,
+           直接按 phase_id 取出对应的 downstream edge names, 只对这些边
+           求和/求均值。这是真正的 movement-level 计算。
+
+        2. **启发式匹配**：基于 upstream_queue 和 downstream_queue 的
+           edge key 做节点名启发式匹配。SUMO 的 edge ID 通常编码了
+           from_node → to_node 信息（如 ``e1_e2`` 或 ``e1toe2``）。
+           对于 upstream edge ``A→B``, 尝试找到 downstream edge ``B→C``,
+           即 downstream key 以 B（upstream 的 to_node）开头。
+
+        3. **回退到全局平均**：以上两种方法都无法匹配时，对全部
+           downstream_queue 取平均值。这不是 movement-specific 的，
+           但总比忽略 downstream 信息要好。
+        """
         phase_obs = obs.phases.get(phase_id)
         if phase_obs is None:
             return 0.0
@@ -252,21 +300,90 @@ class MaxPressureCanonical(_MaxPressureBase):
         # Incoming: queue on the upstream edges belonging to this phase
         incoming = phase_obs.queue
 
-        # Outgoing: for each downstream edge compute its queue;
-        # use matching based on edge key prefix heuristic.
-        # If downstream_queue keys follow "<from_node>_<to_node>" or similar,
-        # we approximate by using all downstream entries scaled by 1/n.
-        # A movement-specific mapping would require network topology info;
-        # here we use a simple per-edge average.
-        if obs.downstream_queue:
-            outgoing = sum(obs.downstream_queue.values())
-            n_out = len(obs.downstream_queue)
-            # movement-specific: attribute downstream proportionally
-            outgoing = outgoing / n_out
-        else:
-            outgoing = 0.0
+        # --- Strategy 1: exact mapping ---
+        if self._phase_downstream_mapping is not None:
+            downstream_edges = self._phase_downstream_mapping.get(phase_id, [])
+            if downstream_edges and obs.downstream_queue:
+                # 真正的 movement-level: 只统计此 phase 对应的下游边
+                matched = [
+                    obs.downstream_queue[e]
+                    for e in downstream_edges
+                    if e in obs.downstream_queue
+                ]
+                if matched:
+                    outgoing = sum(matched) / len(matched)
+                else:
+                    # mapping 中指定的边在观测中不存在（可能网络拓扑变化），回退
+                    outgoing = self._fallback_downstream(obs)
+            else:
+                outgoing = self._fallback_downstream(obs)
+            return incoming - outgoing
 
+        # --- Strategy 2: heuristic edge-key matching ---
+        heuristic_outgoing = self._heuristic_downstream(obs, phase_id)
+        if heuristic_outgoing is not None:
+            return incoming - heuristic_outgoing
+
+        # --- Strategy 3: global average fallback ---
+        outgoing = self._fallback_downstream(obs)
         return incoming - outgoing
+
+    def _fallback_downstream(self, obs: IntersectionObservation) -> float:
+        """全局平均 downstream（非 movement-specific，作为回退策略）。
+
+        TODO: 此方法对所有 phase 使用相同的 downstream 平均值，
+        不区分不同 phase 的 outgoing movements。如果有网络拓扑信息，
+        应通过 ``phase_downstream_mapping`` 构造器参数提供精确映射，
+        以实现真正的 movement-level 压力计算。
+        """
+        if obs.downstream_queue:
+            return sum(obs.downstream_queue.values()) / len(obs.downstream_queue)
+        return 0.0
+
+    @staticmethod
+    def _heuristic_downstream(
+        obs: IntersectionObservation, phase_id: int,
+    ) -> Optional[float]:
+        """启发式匹配：从 upstream_queue 的 key 推断 downstream edge。
+
+        尝试从 upstream edge key 中提取 to_node，然后在 downstream_queue
+        中查找以该 to_node 为 from_node 的边。
+
+        例如 upstream edge ``-e1toe2`` 或 ``e1_e2`` 的 to_node 是 ``e2``,
+        则匹配 downstream edge 中以 ``e2`` 开头或包含 ``e2to`` / ``e2_`` 的 key。
+
+        Returns None if heuristic matching fails (no matches found).
+        """
+        if not obs.upstream_queue or not obs.downstream_queue:
+            return None
+
+        # 收集 upstream edge keys 中可能与 phase_id 相关的 to_node 候选
+        # 注意：upstream_queue 是整个交叉口的入口边，不是 per-phase 的，
+        # 但 PhaseObservation.queue 已经是该 phase 对应的排队数。
+        # 这里我们尝试匹配 upstream_queue 和 downstream_queue 的 key 关系。
+        upstream_keys = list(obs.upstream_queue.keys())
+        downstream_keys = list(obs.downstream_queue.keys())
+
+        if not upstream_keys or not downstream_keys:
+            return None
+
+        matched_downstream_values: List[float] = []
+
+        for up_key in upstream_keys:
+            # 尝试从 upstream key 提取 to_node
+            to_node = _extract_to_node(up_key)
+            if to_node is None:
+                continue
+            # 在 downstream 中查找以 to_node 为 from_node 的边
+            for dn_key in downstream_keys:
+                dn_from = _extract_from_node(dn_key)
+                if dn_from is not None and dn_from == to_node:
+                    matched_downstream_values.append(obs.downstream_queue[dn_key])
+
+        if matched_downstream_values:
+            return sum(matched_downstream_values) / len(matched_downstream_values)
+
+        return None
 
     # ---- plan ----
 
@@ -686,6 +803,52 @@ class MaxPressureSwitchLossAware(MaxPressureCanonical):
 # Canonical 变体在每个 decision interval 自由选择压力最高的相位，
 # 符合 Varaiya (2013) 原始论文的定义，是学术界通用的 baseline。
 MaxPressureSkill = MaxPressureCanonical
+
+
+# ======================================================================
+# Edge-key heuristic helpers (SUMO-style edge naming)
+# ======================================================================
+
+def _extract_to_node(edge_key: str) -> Optional[str]:
+    """从 SUMO 风格的 edge key 提取 to_node。
+
+    支持的格式：
+    - ``prefix_fromNode_toNode_suffix`` (含两个下划线分隔的节点)
+    - ``fromNode_toNode`` (两个下划线分隔的节点)
+    - ``-fromNode_toNode`` (SUMO 反向边前缀 ``-``)
+    - ``fromNodeNtoNodeN`` (SUMO 默认 edge ID 格式，如 ``gneE0toE1``)
+
+    返回第二个节点标识（to_node），如果没有匹配则返回 None。
+    """
+    # 去除 SUMO 反向边前缀
+    clean = edge_key.lstrip("-")
+
+    # 尝试下划线分隔: from_to
+    parts = clean.split("_")
+    if len(parts) >= 2:
+        return parts[-1]
+
+    # 尝试 "XtoY" 格式 (SUMO default junction edge naming)
+    if "to" in clean:
+        idx = clean.rfind("to")
+        return clean[idx + 2:]
+
+    return None
+
+
+def _extract_from_node(edge_key: str) -> Optional[str]:
+    """从 SUMO 风格的 edge key 提取 from_node。"""
+    clean = edge_key.lstrip("-")
+
+    parts = clean.split("_")
+    if len(parts) >= 2:
+        return parts[0]
+
+    if "to" in clean:
+        idx = clean.find("to")
+        return clean[:idx]
+
+    return None
 
 
 # ======================================================================
