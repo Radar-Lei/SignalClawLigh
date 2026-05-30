@@ -226,6 +226,41 @@ class SumoTraCIAdapter:
     def get_arrived_vehicles(self) -> List[str]:
         return self._conn.simulation.getArrivedIDList()
 
+    def get_intersection_throughput(self, tls_id: str) -> int:
+        """返回本步通过指定路口 outgoing edges 的移动车辆总数。
+
+        通过统计目标 TLS 所有 outgoing edges 上的移动车辆数
+        （总车辆数 - 静止车辆数）来近似衡量路口的实际通过量。
+        比 get_departed_vehicles() 更精确，因为它只计算真正经过
+        目标路口的车辆，而非全网出发车辆。
+        """
+        if tls_id not in self._tls_info:
+            return 0
+
+        info = self._tls_info[tls_id]
+        # 收集所有 green phase 的 outgoing edges（去重）
+        all_outgoing: set = set()
+        for gp in info['green_phases']:
+            all_outgoing.update(info['phase_outgoing'].get(gp, set()))
+
+        if not all_outgoing:
+            return 0
+
+        # 统计 outgoing edges 上的移动车辆数（总车辆 - 静止车辆）
+        moving_count = 0
+        for edge_id in all_outgoing:
+            try:
+                n_veh = self._conn.edge.getLastStepVehicleNumber(edge_id)
+                n_halting = 0
+                for i in range(self._conn.edge.getLaneNumber(edge_id)):
+                    lane_id = f"{edge_id}_{i}"
+                    n_halting += self._conn.lane.getLastStepHaltingNumber(lane_id)
+                moving_count += max(n_veh - n_halting, 0)
+            except Exception:
+                pass
+
+        return moving_count
+
     def get_vehicle_travel_time(self, veh_id: str) -> float:
         """Get travel time for a vehicle"""
         try:

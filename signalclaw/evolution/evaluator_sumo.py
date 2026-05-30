@@ -43,6 +43,7 @@ from signalclaw.core.state import (
     PhaseObservation,
 )
 from signalclaw.execution.online_controller import OnlineController
+from signalclaw.execution.phase_command_executor import PhaseCommandExecutor
 from signalclaw.network.neighbor_graph import NeighborGraph
 from signalclaw.skills.cohort import SkillCohort
 from signalclaw.skills.loader import _dynamic_load
@@ -134,7 +135,7 @@ NON_DEGRADATION_GATES = {
     "completed_vehicles": {
         "direction": "lower_bound",   # candidate 不能低于 incumbent 的 X%
         "threshold_ratio": 0.99,       # 不低于 incumbent 的 99%
-        "metric_key": "throughput",    # 对应 metrics 中的键名
+        "metric_key": "completed_vehicles",  # 对应 metrics 中的键名
         "description": "completed_vehicles 不低于 incumbent 的 99%",
     },
     "avg_queue": {
@@ -455,6 +456,7 @@ class SUMOEvaluator:
         phase_appearances: Dict[int, int] = defaultdict(int)
         total_safety_clips = 0
         throughput_window: List[float] = []
+        arrived_window: List[float] = []
 
         try:
             adapter.start()
@@ -521,9 +523,11 @@ class SUMOEvaluator:
                         pass  # 正常相位切换
                     prev_phase_id = current_phase
 
-                # 收集 throughput（通过路口的车辆数）
-                departed = adapter.get_departed_vehicles()
-                throughput_window.append(len(departed))
+                # 收集 throughput（目标路口的通过量 + 全网完成行程车辆数）
+                intersection_tp = adapter.get_intersection_throughput(crossing_id)
+                throughput_window.append(intersection_tp)
+                completed_count = len(adapter.get_arrived_vehicles())
+                arrived_window.append(completed_count)
 
                 # 收集 safety clip 计数
                 total_safety_clips = controller.stats.safety_clip_count
@@ -536,6 +540,8 @@ class SUMOEvaluator:
                 "mean_queue": sum(step_queue_lengths) / n_valid if step_queue_lengths else 0.0,
                 "max_queue": max_queue,
                 "throughput": sum(throughput_window),
+                "intersection_throughput": sum(throughput_window),
+                "completed_vehicles": sum(arrived_window),
                 "avg_throughput_per_step": sum(throughput_window) / max(len(throughput_window), 1),
                 "safety_overrides": float(total_safety_clips),
                 "total_steps": float(total_steps),
