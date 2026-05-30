@@ -23,6 +23,9 @@ class SimulationMetrics:
     waiting_times: List[float] = field(default_factory=list)
     total_stops_from_tripinfo: Optional[int] = None
     step_metrics: Dict[str, List[StepMetrics]] = field(default_factory=dict)
+    # TripInfoCollector 计算的时间加权平均 queue（真实数据，每步每 lane halting 的时间平均）
+    # 优先级高于 step_metrics 中的采样平均。
+    _collector_avg_queue: Optional[float] = field(default=None, repr=False)
 
     def add_step(self, m: StepMetrics):
         if m.tls_id not in self.step_metrics:
@@ -60,13 +63,23 @@ class SimulationMetrics:
             avg_waiting_time = sum(all_waits) / n
             waiting_time_source = "lane_sample"
 
-        # total_stops: 优先使用 tripinfo 真实 stops，否则标记 N/A
+        # total_stops: 优先使用 TripInfoCollector 的逐步累加真实 halting number，
+        #              其次使用 tripinfo XML 中的 stops，否则标记 N/A
         if self.total_stops_from_tripinfo is not None:
             total_stops = self.total_stops_from_tripinfo
-            stops_source = "tripinfo"
+            stops_source = "tripinfo_collector"  # 来自 TripInfoCollector 逐步累加
         else:
             total_stops = None  # N/A — 不再使用 proxy
             stops_source = "N/A"
+
+        # avg_queue: 优先使用 TripInfoCollector 的时间加权平均（真实数据），
+        #            其次使用 step_metrics 中的采样平均（近似值）
+        if self._collector_avg_queue is not None:
+            avg_queue = self._collector_avg_queue
+            queue_source = "collector_time_weighted"  # 真实: 每步每 lane halting 的时间加权平均
+        else:
+            avg_queue = sum(all_queues) / n  # 近似: 每 10 步采样平均
+            queue_source = "step_sample"
 
         # throughput_per_hour: completed_vehicles / simulated_hours
         simulated_hours = max(self.total_sim_time / 3600.0, 1e-9)
@@ -77,7 +90,8 @@ class SimulationMetrics:
             "avg_travel_time": avg_travel_time,
             "completed_vehicles": completed_vehicles,
             "throughput_per_hour": throughput_per_hour,
-            "avg_queue": sum(all_queues) / n,
+            "avg_queue": avg_queue,
+            "avg_queue_source": queue_source,
             "max_queue": max(all_queues) if all_queues else 0,
             "avg_waiting_time": avg_waiting_time,
             "waiting_time_source": waiting_time_source,

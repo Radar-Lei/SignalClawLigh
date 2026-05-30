@@ -44,7 +44,7 @@ class GLMClient:
         self,
         messages: list[dict],
         temperature: float = 0.7,
-        max_tokens: int = 4096,
+        max_tokens: int = 16384,
         stream: bool = False,
     ) -> dict:
         return {
@@ -60,9 +60,13 @@ class GLMClient:
         user_message: str,
         system_message: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 4096,
+        max_tokens: int = 16384,
     ) -> str:
-        """非流式对话，返回完整回复文本。"""
+        """非流式对话，返回完整回复文本。
+
+        支持 GLM 思考/推理模型：当 reasoning_content 存在但 content 为空时，
+        会根据 finish_reason 决定是抛出 token 耗尽错误，还是返回推理内容。
+        """
         messages = []
         if system_message:
             messages.append({"role": "system", "content": system_message})
@@ -74,16 +78,33 @@ class GLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+
+        message = data["choices"][0]["message"]
+        content = message.get("content", "")
+        reasoning = message.get("reasoning_content", "")
+        finish_reason = data["choices"][0].get("finish_reason", "")
+
+        if not content and finish_reason == "length":
+            raise RuntimeError(
+                f"GLM 推理 token 耗尽（finish_reason=length），请增加 max_tokens。"
+                f"reasoning 阶段已使用 "
+                f"{data.get('usage', {}).get('completion_tokens', '?')} tokens。"
+            )
+
+        return content or reasoning
 
     def chat_stream(
         self,
         user_message: str,
         system_message: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 4096,
+        max_tokens: int = 16384,
     ) -> Generator[str, None, None]:
-        """流式对话，逐 token 生成回复片段。"""
+        """流式对话，逐 token 生成回复片段。
+
+        支持 GLM 思考/推理模型：优先输出 content，若 content 为空则回退到
+        reasoning_content。
+        """
         messages = []
         if system_message:
             messages.append({"role": "system", "content": system_message})
@@ -107,9 +128,19 @@ class GLMClient:
                         break
                     try:
                         chunk = json.loads(data_str)
-                        delta = chunk["choices"][0]["delta"]
-                        if "content" in delta:
+                        choice = chunk["choices"][0]
+                        delta = choice["delta"]
+                        # 优先输出 content，回退到 reasoning_content
+                        if "content" in delta and delta["content"]:
                             yield delta["content"]
+                        elif "reasoning_content" in delta and delta["reasoning_content"]:
+                            yield delta["reasoning_content"]
+                        # 检查流式结束时的 finish_reason
+                        if choice.get("finish_reason") == "length":
+                            raise RuntimeError(
+                                "GLM 推理 token 耗尽（finish_reason=length），"
+                                "请增加 max_tokens。"
+                            )
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
 

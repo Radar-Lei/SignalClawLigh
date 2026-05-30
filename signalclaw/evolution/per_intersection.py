@@ -100,6 +100,12 @@ class PerIntersectionEvolver:
         if sql_profile is not None:
             self.prior_checker = PriorConsistencyChecker(sql_profile)
 
+        # Incumbent 跟踪：用于 select_deployable_champion 的 non-degradation gate
+        self._incumbents: Dict[str, Optional[ArchiveEntry]] = {
+            "cycle": None,
+            "phase": None,
+        }
+
     # ======================================================================
     # Public API
     # ======================================================================
@@ -145,9 +151,11 @@ class PerIntersectionEvolver:
         if seed_cycle_ok:
             seed_cycle_entry.selected = True
             self.archive.add(seed_cycle_entry)
+            self._incumbents["cycle"] = seed_cycle_entry
         if seed_phase_ok:
             seed_phase_entry.selected = True
             self.archive.add(seed_phase_entry)
+            self._incumbents["phase"] = seed_phase_entry
 
         # ---- Step 2: 进化 CycleSkill（固定 PhaseSkill） ----
         current_cycle_code = seed_cycle_code
@@ -163,6 +171,7 @@ class PerIntersectionEvolver:
             if best_cycle is not None:
                 current_cycle_code = best_cycle.code
                 results["cycle"] = best_cycle
+                self._incumbents["cycle"] = best_cycle
             # 如果没找到更好的，保留当前
 
         # ---- Step 3: 进化 PhaseSkill（固定 CycleSkill_best） ----
@@ -176,6 +185,7 @@ class PerIntersectionEvolver:
             if best_phase is not None:
                 current_phase_code = best_phase.code
                 results["phase"] = best_phase
+                self._incumbents["phase"] = best_phase
 
         # ---- Step 4: 联合修复（可选，用最佳 cycle 重新跑一轮 phase） ----
         if results["cycle"] is not None:
@@ -187,6 +197,7 @@ class PerIntersectionEvolver:
             )
             if joint_phase is not None:
                 results["phase"] = joint_phase
+                self._incumbents["phase"] = joint_phase
 
         # ---- Step 5: 标记最佳 ----
         for skill_type, entry in results.items():
@@ -331,12 +342,15 @@ class PerIntersectionEvolver:
         if not candidates:
             return None
 
-        best = self.selector.select(candidates, self.crossing_id, "cycle")
-        return best
-
-    # ======================================================================
-    # Internal: Phase Evolution
-    # ======================================================================
+        # 分层选择：archive best 用于记录，deployable champion 用于部署
+        archive_best = self.selector.select_archive_best(
+            candidates, seed_entry=None,
+        )
+        champion = self.selector.select_deployable_champion(
+            candidates, incumbent=self._current_incumbent("cycle"),
+        )
+        # 如果有 deployable champion 则优先返回，否则返回 archive best
+        return champion if champion is not None else archive_best
 
     def _evolve_phase(
         self,
@@ -460,12 +474,23 @@ class PerIntersectionEvolver:
         if not candidates:
             return None
 
-        best = self.selector.select(candidates, self.crossing_id, "phase")
-        return best
+        # 分层选择：archive best 用于记录，deployable champion 用于部署
+        archive_best = self.selector.select_archive_best(
+            candidates, seed_entry=None,
+        )
+        champion = self.selector.select_deployable_champion(
+            candidates, incumbent=self._current_incumbent("phase"),
+        )
+        # 如果有 deployable champion 则优先返回，否则返回 archive best
+        return champion if champion is not None else archive_best
 
     # ======================================================================
     # Internal: Helpers
     # ======================================================================
+
+    def _current_incumbent(self, skill_type: str) -> Optional[ArchiveEntry]:
+        """返回指定 skill_type 的当前 incumbent（用于 non-degradation gate）。"""
+        return self._incumbents.get(skill_type)
 
     def _register_seed(
         self, seed_code: str, skill_type: str

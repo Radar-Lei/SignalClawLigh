@@ -35,6 +35,120 @@ from signalclaw.execution.online_controller import OnlineController
 
 
 # ======================================================================
+# 常量
+# ======================================================================
+
+# PhaseObservation 中 predicted_arrival 的默认值。
+# TODO: 理想情况下应从预测模块获取真实值。当 enable_prediction=False 时，
+#       predicted_arrival 不可用，skill 不应依赖此特征做决策。
+DEFAULT_PREDICTED_ARRIVAL = 0.0
+
+
+# ======================================================================
+# TripInfoCollector — 仿真过程中实时收集真实指标
+# ======================================================================
+
+class TripInfoCollector:
+    """在仿真运行过程中逐步收集真实指标，替代仿真后解析 tripinfo XML。
+
+    收集内容:
+    - completed_vehicles: 完成旅程的车辆数
+    - total_travel_time: 累计行程时间（从 departed 到 arrived）
+    - total_waiting_time: 累计等待时间（从 traci.vehicle.getWaitingTime 逐车累加）
+    - total_stops: 累计停车次数（从每步每 lane halting number 累加，是真实数据）
+    - total_halting_time_steps: 总 halting 车道步数（用于计算时间加权平均 queue）
+    - total_lanes_monitored: 监控的车道步数（用于计算时间加权平均 queue）
+    """
+
+    def __init__(self):
+        # 车辆跟踪: departed -> sim_time
+        self._vehicle_depart: Dict[str, float] = {}
+        # 已完成车辆的 travel time 列表
+        self._travel_times: List[float] = []
+        # 已完成车辆的 waiting time 列表（从 traci.vehicle 获取）
+        self._waiting_times: List[float] = []
+        # 停车次数: 每步每 lane halting number 的累加（真实数据）
+        self._total_stops: int = 0
+        # 时间加权平均 queue 的分子: 每步所有 lane halting number 之和
+        self._halting_sum: float = 0.0
+        # 时间加权平均 queue 的分母: 每步监控的 lane 数
+        self._lane_steps: int = 0
+        # 完成车辆数
+        self._completed_vehicles: int = 0
+
+    def collect_departed(self, traci, sim_time: float):
+        """记录每步新出发的车辆。"""
+        for veh_id in traci.simulation.getDepartedIDList():
+            self._vehicle_depart[veh_id] = sim_time
+
+    def collect_arrived(self, traci, sim_time: float):
+        """记录每步到达的车辆，收集其 travel time 和 waiting time。"""
+        for veh_id in traci.simulation.getArrivedIDList():
+            if veh_id in self._vehicle_depart:
+                travel_time = sim_time - self._vehicle_depart[veh_id]
+                self._travel_times.append(travel_time)
+                self._completed_vehicles += 1
+                del self._vehicle_depart[veh_id]
+
+            # 尝试获取车辆累计 waiting time（到达瞬间仍可获取）
+            try:
+                wt = traci.vehicle.getWaitingTime(veh_id)
+                if wt is not None and wt > 0:
+                    self._waiting_times.append(wt)
+            except (traci.exceptions.TraCIException, Exception):
+                pass
+
+    def collect_lane_stats(self, traci, lane_list: List[str]):
+        """每步收集所有监控 lane 的 halting number（用于 stops 和 avg_queue）。
+
+        这是真实的 stops 来源: 每步每 lane 有 halting 车辆即计为一次停车。
+        总 stops = 每步每 lane halting number 的累加。
+        avg_queue = halting_sum / lane_steps（时间加权平均）。
+        """
+        step_halting = 0
+        step_lanes = 0
+        for lane in lane_list:
+            try:
+                h = traci.lane.getLastStepHaltingNumber(lane)
+                step_halting += h
+                step_lanes += 1
+            except traci.exceptions.TraCIException:
+                pass
+        self._total_stops += step_halting
+        self._halting_sum += step_halting
+        self._lane_steps += step_lanes
+
+    def get_completed_vehicles(self) -> int:
+        return self._completed_vehicles
+
+    def get_travel_times(self) -> List[float]:
+        return self._travel_times
+
+    def get_waiting_times(self) -> List[float]:
+        return self._waiting_times
+
+    def get_total_stops(self) -> int:
+        """真实停车次数: 每步每 lane halting number 累加。"""
+        return self._total_stops
+
+    def get_avg_queue(self) -> float:
+        """时间加权平均 queue: 总 halting / 总 lane 步数。"""
+        return self._halting_sum / max(self._lane_steps, 1)
+
+    def get_report(self, simulated_hours: float) -> dict:
+        """生成最终指标报告。"""
+        cv = max(self._completed_vehicles, 1)
+        return {
+            'completed_vehicles': self._completed_vehicles,
+            'throughput_per_hour': self._completed_vehicles / max(simulated_hours, 0.01),
+            'avg_travel_time': sum(self._travel_times) / cv,
+            'avg_waiting_time': sum(self._waiting_times) / max(len(self._waiting_times), 1),
+            'total_stops': self._total_stops,
+            'avg_queue': self.get_avg_queue(),
+        }
+
+
+# ======================================================================
 # 辅助函数
 # ======================================================================
 
@@ -70,12 +184,17 @@ class ExperimentRunner:
     def __init__(self, sumocfg_path: str, seed: int = 42,
                  decision_interval: float = 5.0,
                  step_length: float = 1.0,
-                 sim_duration: float = 3600.0):
+                 sim_duration: float = 3600.0,
+                 enable_prediction: bool = False):
         self.sumocfg_path = sumocfg_path
         self.seed = seed
         self.decision_interval = decision_interval
         self.step_length = step_length
         self.sim_duration = sim_duration
+        # 是否启用到达车辆预测。为 False 时 PhaseObservation.predicted_arrival
+        # 使用 DEFAULT_PREDICTED_ARRIVAL（0.0），并在观测中标注不可用。
+        # TODO: 接入真实预测模块后默认改为 True。
+        self.enable_prediction = enable_prediction
         self.results: Dict[str, SimulationMetrics] = {}
 
     # ------------------------------------------------------------------
@@ -162,9 +281,27 @@ class ExperimentRunner:
         if verbose:
             print(f"  [{method_name}] Found {len(tls_ids)} traffic lights")
 
-        # 车辆跟踪（保留作为 tripinfo 不可用时的 fallback）
-        vehicle_depart: Dict[str, float] = {}
-        vehicle_arrived: List[float] = []
+        # ------------------------------------------------------------------
+        # 预构建所有监控 lane 列表（避免每步重复字符串拼接和 edge 查询）
+        # ------------------------------------------------------------------
+        monitored_lanes: List[str] = []
+        for tls_id in tls_ids:
+            td = tls_data[tls_id]
+            for _phase_idx, in_edges, _out_edges in td['green_info']:
+                for edge in in_edges:
+                    try:
+                        n_lanes_edge = traci.edge.getLaneNumber(edge)
+                        for li in range(n_lanes_edge):
+                            monitored_lanes.append(f"{edge}_{li}")
+                    except traci.exceptions.TraCIException:
+                        pass
+        # 去重（同一 lane 可能被多个 phase 引用）
+        monitored_lanes = list(dict.fromkeys(monitored_lanes))
+
+        # ------------------------------------------------------------------
+        # 初始化 TripInfoCollector（逐步收集真实指标）
+        # ------------------------------------------------------------------
+        collector = TripInfoCollector()
 
         # 累计到达车辆数（用于计算每步 throughput 差值）
         last_arrived_count = 0
@@ -202,13 +339,12 @@ class ExperimentRunner:
             step += 1
             sim_time = traci.simulation.getTime()
 
-            # 车辆跟踪（fallback，优先使用 tripinfo）
-            for veh_id in traci.simulation.getDepartedIDList():
-                vehicle_depart[veh_id] = sim_time
-            for veh_id in traci.simulation.getArrivedIDList():
-                if veh_id in vehicle_depart:
-                    vehicle_arrived.append(sim_time - vehicle_depart[veh_id])
-                    del vehicle_depart[veh_id]
+            # --- 逐步收集车辆指标（真实数据）---
+            collector.collect_departed(traci, sim_time)
+            collector.collect_arrived(traci, sim_time)
+
+            # --- 逐步收集 lane 级 halting 数据（真实 stops + avg_queue）---
+            collector.collect_lane_stats(traci, monitored_lanes)
 
             # --- 控制交通灯 ---
             if controller is None:
@@ -227,7 +363,7 @@ class ExperimentRunner:
                     traci, tls_ids, tls_data, sim_time, controller, tls_state
                 )
 
-            # 收集指标（每 10 步）
+            # 收集指标快照（每 10 步，用于时间序列分析和可视化）
             if step % 10 == 0:
                 total_queue = 0.0
                 total_wait = 0.0
@@ -251,13 +387,15 @@ class ExperimentRunner:
                 throughput_delta = current_arrived_count - last_arrived_count
                 last_arrived_count = current_arrived_count
 
+                # 真实 stops: 使用 TripInfoCollector 的累计值，再减去上次的快照值
                 metrics.add_step(StepMetrics(
                     tls_id="ALL", step=step, sim_time=sim_time,
                     phase_id=0, queue_total=total_queue,
                     waiting_time_avg=total_wait / max(n_lanes, 1),
                     throughput=throughput_delta,
                     delay_total=total_wait,
-                    stops=0,  # stops 将在仿真结束后从 tripinfo 获取
+                    # 真实 stops: 从 TripInfoCollector 获取累计 halting number
+                    stops=collector.get_total_stops(),
                 ))
 
             if verbose and step % 600 == 0:
@@ -266,44 +404,47 @@ class ExperimentRunner:
                 q = last_m.queue_total if last_m else 0
                 print(f"  [{method_name}] Step {step}, time={sim_time:.0f}s, queue={q:.0f}")
 
-        metrics.travel_times = vehicle_arrived
+        # --- 使用 TripInfoCollector 的真实数据 ---
+        metrics.travel_times = collector.get_travel_times()
         metrics.total_sim_time = sim_time
+
+        # 使用 TripInfoCollector 的时间加权平均 queue（真实数据，非采样平均）
+        metrics._collector_avg_queue = collector.get_avg_queue()
+
+        # 真实 stops 来自 TripInfoCollector 的逐步累加
+        metrics.total_stops_from_tripinfo = collector.get_total_stops()
+
         traci.close()
 
-        # --- 从 tripinfo 解析真实指标 ---
+        # --- 交叉验证: 从 tripinfo XML 解析 travel time / waiting time ---
         tripinfo_travel_times: List[float] = []
         tripinfo_waiting_times: List[float] = []
-        tripinfo_stops_total = 0
 
         try:
             tree = ET.parse(tripinfo_path)
             root = tree.getroot()
             for trip in root.findall('tripinfo'):
-                # travel time
                 tt = trip.get('duration')
                 if tt is not None:
                     tripinfo_travel_times.append(float(tt))
-                # waiting time
                 wt = trip.get('waitingTime')
                 if wt is not None:
                     tripinfo_waiting_times.append(float(wt))
-                # stops
-                # tripinfo 中每个 trip 可以有 <stop> 子元素，也可以从 stopTime 属性统计
-                stop_children = trip.findall('stop')
-                tripinfo_stops_total += len(stop_children)
 
+            # tripinfo XML 优先级最高（仿真后的完整数据），覆盖实时收集的结果
             if tripinfo_travel_times:
                 metrics.travel_times = tripinfo_travel_times
                 metrics.waiting_times = tripinfo_waiting_times
-                metrics.total_stops_from_tripinfo = tripinfo_stops_total
 
             if verbose:
-                src = "tripinfo" if tripinfo_travel_times else "fallback"
+                src = "tripinfo" if tripinfo_travel_times else "collector_realtime"
                 print(f"  [{method_name}] Metrics source: {src} "
-                      f"({len(tripinfo_travel_times)} trips parsed)")
+                      f"({len(tripinfo_travel_times)} trips from XML, "
+                      f"{collector.get_completed_vehicles()} from realtime)")
         except (ET.ParseError, FileNotFoundError) as e:
             if verbose:
-                print(f"  [{method_name}] tripinfo parse failed ({e}), using fallback metrics")
+                print(f"  [{method_name}] tripinfo parse failed ({e}), "
+                      f"using realtime collector metrics")
         finally:
             # 清理临时文件
             try:
@@ -462,7 +603,14 @@ class ExperimentRunner:
 
     def _build_observation(self, traci, tls_id: str, tls_data: dict,
                            current_phase: int = None) -> IntersectionObservation:
-        """从当前 SUMO 状态构建路口观测。"""
+        """从当前 SUMO 状态构建路口观测。
+
+        关于 predicted_arrival:
+        - 当 self.enable_prediction=False（默认）时，PhaseObservation.predicted_arrival
+          为 DEFAULT_PREDICTED_ARRIVAL（0.0），是一个恒为 0 的占位值。
+          Skill 不应依赖此特征做决策。可通过 self.enable_prediction 检查可用性。
+        - 当 self.enable_prediction=True 时，将从预测模块获取真实值（TODO）。
+        """
         td = tls_data[tls_id]
 
         if current_phase is None:
@@ -510,11 +658,20 @@ class ExperimentRunner:
                 except traci.exceptions.TraCIException:
                     pass
 
+            # predicted_arrival:
+            # - enable_prediction=True 时从预测模块获取（TODO: 接入真实预测）
+            # - enable_prediction=False 时使用 DEFAULT_PREDICTED_ARRIVAL（0.0）
+            #   skill 不应依赖此特征做决策，因为它是恒为 0 的占位值
+            pred_arrival = DEFAULT_PREDICTED_ARRIVAL
+            if self.enable_prediction:
+                # TODO: 调用预测模块获取真实 predicted_arrival
+                pass
+
             phases_obs[phase_idx] = PhaseObservation(
                 phase_id=phase_idx,
                 queue=queue,
                 waiting_time=wait / max(n, 1),
-                predicted_arrival=0.0,
+                predicted_arrival=pred_arrival,
                 elapsed_green=elapsed if phase_idx == current_phase else 0.0,
                 min_green=10.0,
                 max_green=60.0,

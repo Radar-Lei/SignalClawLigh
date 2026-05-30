@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Dict, List, Optional
 
 from signalclaw.evolution.archive import ArchiveEntry
@@ -61,6 +62,11 @@ class SkillSelector:
     ) -> Optional[ArchiveEntry]:
         """从候选中选择最佳。
 
+        .. deprecated::
+            此方法同时负责 archive 选择和 champion 选择，
+            fallback 会把 archive best 误当 evolved best。
+            请使用 :meth:`select_archive_best` 或 :meth:`select_deployable_champion`。
+
         优先选 champion（必须通过 SUMO 硬门槛），
         如果没有 champion 则退回 archive 级候选。
 
@@ -80,6 +86,12 @@ class SkillSelector:
         -------
         ArchiveEntry or None
         """
+        warnings.warn(
+            "select() 已弃用，fallback 会把 archive best 误当 evolved best。"
+            "请使用 select_archive_best() 或 select_deployable_champion()。",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         # 第一级：archive 过滤（AST + replay）
         archive_valid = self._filter_archive_candidates(candidates)
         if not archive_valid:
@@ -214,6 +226,288 @@ class SkillSelector:
         scored = [(c, self.compute_objective(c, seed_baseline)) for c in archive_valid]
         scored.sort(key=lambda x: x[1])
         return scored
+
+    # ------------------------------------------------------------------
+    # New split API
+    # ------------------------------------------------------------------
+
+    def select_archive_best(
+        self,
+        candidates: List[ArchiveEntry],
+        seed_entry: Optional[ArchiveEntry] = None,
+    ) -> Optional[ArchiveEntry]:
+        """选择最佳 archive 候选，用于研究和分析。
+
+        不要求 SUMO sealed eval，仅按 replay_score 排序。
+        适合用于分析进化趋势、研究代码变体等非部署场景。
+
+        Parameters
+        ----------
+        candidates : List[ArchiveEntry]
+            候选列表
+        seed_entry : ArchiveEntry, optional
+            seed skill 的 ArchiveEntry，用于相对评分。
+
+        Returns
+        -------
+        ArchiveEntry or None
+            archive 级最佳候选，如果无有效候选则返回 None。
+        """
+        archive_valid = self._filter_archive_candidates(candidates)
+        if not archive_valid:
+            logger.info("select_archive_best: 无有效 archive 候选")
+            return None
+
+        seed_baseline = self._get_seed_baseline(seed_entry)
+        scored = [(c, self.compute_objective(c, seed_baseline)) for c in archive_valid]
+        scored.sort(key=lambda x: x[1])
+
+        logger.info(
+            "select_archive_best: %d 个有效候选，最优 score=%.4f",
+            len(archive_valid), scored[0][1],
+        )
+        return scored[0][0]
+
+    def select_deployable_champion(
+        self,
+        candidates: List[ArchiveEntry],
+        incumbent: Optional[ArchiveEntry] = None,
+    ) -> Optional[ArchiveEntry]:
+        """选择可部署的 champion 候选。
+
+        核心规则：
+        1. 候选必须有真实的 sumo_report（非空、非零）
+        2. 候选必须通过 paired non-degradation gate（相对 incumbent 不退化）
+        3. 如果没有候选通过，返回 incumbent（不是 archive best）
+        4. incumbent 为 None 时使用 seed baseline 作为对照
+
+        Parameters
+        ----------
+        candidates : List[ArchiveEntry]
+            候选列表
+        incumbent : ArchiveEntry, optional
+            当前 champion（即 seed entry 或上一代 champion）。
+            用于 non-degradation gate 对照。
+            如果为 None，则仅检查绝对门槛。
+
+        Returns
+        -------
+        ArchiveEntry or None
+            可部署的 champion 候选；如果没有候选通过门槛，返回 incumbent。
+        """
+        # 先做 archive 级基本过滤（AST + replay）
+        archive_valid = self._filter_archive_candidates(candidates)
+        if not archive_valid:
+            logger.info(
+                "select_deployable_champion: 无有效 archive 候选，"
+                "返回 incumbent=%s",
+                incumbent.candidate_id if incumbent else "None",
+            )
+            return incumbent
+
+        # 获取 incumbent 的 SUMO 报告作为对照
+        inc_report = None
+        if incumbent and incumbent.sumo_report:
+            inc_report = incumbent.sumo_report
+
+        # 硬门槛过滤
+        passed = []
+        for c in archive_valid:
+            if self._passes_hard_gates(c, inc_report):
+                passed.append(c)
+            else:
+                logger.debug(
+                    "select_deployable_champion: 候选 %s 未通过硬门槛",
+                    c.candidate_id,
+                )
+
+        if not passed:
+            logger.info(
+                "select_deployable_champion: %d 个候选均未通过硬门槛，"
+                "返回 incumbent=%s",
+                len(archive_valid),
+                incumbent.candidate_id if incumbent else "None",
+            )
+            return incumbent
+
+        # 软目标排序：按 _compute_champion_score 选最优
+        scored = [
+            (c, self._compute_champion_score(c, inc_report))
+            for c in passed
+        ]
+        scored.sort(key=lambda x: x[1])
+
+        champion = scored[0][0]
+        incumbent_id = incumbent.candidate_id if incumbent else None
+
+        # 标记 champion
+        champion.mark_deployable_champion(incumbent_skill_id=incumbent_id)
+
+        # 标记被拒绝的候选
+        for c in archive_valid:
+            if c.candidate_id != champion.candidate_id and not c.accepted_for_deployment:
+                reason = self._check_champion_gates(c, inc_report)
+                if reason:
+                    c.mark_rejected(reason=reason, incumbent_skill_id=incumbent_id)
+                else:
+                    # 通过了硬门槛但软排序靠后
+                    c.mark_rejected(
+                        reason=f"软排序劣于 champion {champion.candidate_id}",
+                        incumbent_skill_id=incumbent_id,
+                    )
+
+        logger.info(
+            "select_deployable_champion: %d/%d 候选通过硬门槛，"
+            "最优 score=%.4f, candidate=%s",
+            len(passed), len(archive_valid),
+            scored[0][1], champion.candidate_id,
+        )
+        return champion
+
+    # ------------------------------------------------------------------
+    # Champion hard gates & soft scoring (for select_deployable_champion)
+    # ------------------------------------------------------------------
+
+    def _passes_hard_gates(
+        self,
+        candidate: ArchiveEntry,
+        incumbent_report: Optional[Dict] = None,
+    ) -> bool:
+        """候选必须满足所有硬门槛才能进入排序。
+
+        Parameters
+        ----------
+        candidate : ArchiveEntry
+            待检查的候选
+        incumbent_report : dict, optional
+            incumbent 的 sumo_report dict。如果为 None，只检查绝对门槛。
+
+        Returns
+        -------
+        bool
+            True 表示通过所有硬门槛。
+        """
+        # ── 必须有真实 sumo_report ──
+        if not candidate.sumo_report:
+            return False
+
+        cand_metrics = candidate.sumo_report.get("metrics", {})
+        if not cand_metrics:
+            return False
+
+        # total_steps 为 0 表示未真正评估
+        if candidate.sumo_report.get("total_steps", 0) == 0:
+            return False
+
+        # ── 与 incumbent 对照的 non-degradation gate ──
+        if incumbent_report:
+            inc_metrics = incumbent_report.get("metrics", {})
+            if inc_metrics:
+                # completed_vehicles (throughput) 不能下降超过 1%
+                cand_tp = cand_metrics.get("throughput", 0.0)
+                inc_tp = inc_metrics.get("throughput", 0.0)
+                if inc_tp > 0 and cand_tp < inc_tp * 0.99:
+                    logger.debug(
+                        "硬门槛失败 [throughput]: cand=%.1f < inc=%.1f * 0.99",
+                        cand_tp, inc_tp,
+                    )
+                    return False
+
+                # avg_waiting_time 不能上升超过 3%
+                cand_wait = cand_metrics.get("mean_waiting", float("inf"))
+                inc_wait = inc_metrics.get("mean_waiting", float("inf"))
+                if inc_wait > 0 and cand_wait > inc_wait * 1.03:
+                    logger.debug(
+                        "硬门槛失败 [mean_waiting]: cand=%.2f > inc=%.2f * 1.03",
+                        cand_wait, inc_wait,
+                    )
+                    return False
+
+                # avg_queue 不能上升超过 3%
+                cand_queue = cand_metrics.get("mean_queue", float("inf"))
+                inc_queue = inc_metrics.get("mean_queue", float("inf"))
+                if inc_queue > 0 and cand_queue > inc_queue * 1.03:
+                    logger.debug(
+                        "硬门槛失败 [mean_queue]: cand=%.2f > inc=%.2f * 1.03",
+                        cand_queue, inc_queue,
+                    )
+                    return False
+
+                # 安全违规必须为 0
+                safety_violations = cand_metrics.get("safety_overrides", 0)
+                if safety_violations > 0:
+                    logger.debug(
+                        "硬门槛失败 [safety_overrides]: %d > 0",
+                        safety_violations,
+                    )
+                    return False
+
+                # 相位饥饿必须为 0
+                phase_starvation = cand_metrics.get("phase_starvation_ratio", 0)
+                if phase_starvation > 0:
+                    logger.debug(
+                        "硬门槛失败 [phase_starvation]: %.4f > 0",
+                        phase_starvation,
+                    )
+                    return False
+
+        return True
+
+    def _compute_champion_score(
+        self,
+        candidate: ArchiveEntry,
+        incumbent_report: Optional[Dict] = None,
+    ) -> float:
+        """计算候选的综合评分（越低越好）。
+
+        使用相对 incumbent 的归一化比率，避免绝对值偏差。
+
+        Parameters
+        ----------
+        candidate : ArchiveEntry
+            待评分的候选
+        incumbent_report : dict, optional
+            incumbent 的 sumo_report dict。
+
+        Returns
+        -------
+        float
+            综合评分，越低越好。
+        """
+        report = candidate.sumo_report.get("metrics", {})
+
+        if incumbent_report:
+            inc_metrics = incumbent_report.get("metrics", {})
+
+            # 归一化比率（candidate / incumbent）
+            inc_wait = max(inc_metrics.get("mean_waiting", 0.01), 0.01)
+            inc_queue = max(inc_metrics.get("mean_queue", 0.01), 0.01)
+            inc_travel = max(inc_metrics.get("mean_travel_time", 0.01), 0.01)
+            inc_tp = max(inc_metrics.get("throughput", 1.0), 0.01)
+
+            n_wait = report.get("mean_waiting", 0.0) / inc_wait
+            n_queue = report.get("mean_queue", 0.0) / inc_queue
+            n_travel = report.get("mean_travel_time", 0.0) / inc_travel
+            n_completed = report.get("throughput", 1.0) / inc_tp
+        else:
+            n_wait = n_queue = n_travel = n_completed = 1.0
+
+        safety_penalty = report.get("safety_overrides", 0) * 2.0
+        spillback_penalty = report.get("spillback_ratio", 0) * 1.5
+        starvation_penalty = report.get("phase_starvation_ratio", 0) * 1.0
+        cycle_volatility = report.get("cycle_volatility", 0) * 0.3
+
+        J = (
+            1.0 * n_wait
+            + 1.0 * n_queue
+            + 0.6 * n_travel
+            - 0.8 * n_completed
+            + safety_penalty
+            + spillback_penalty
+            + starvation_penalty
+            + cycle_volatility
+        )
+        return J
 
     # ------------------------------------------------------------------
     # Seed baseline

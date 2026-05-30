@@ -42,6 +42,16 @@ class ArchiveEntry:
     rejection_reason: str = ""
     created_at: str = ""
 
+    # ── 部署状态硬字段 ──
+    # 区分 archive 候选（用于研究）和可部署 champion
+    is_archive_candidate: bool = True
+    is_deployable_champion: bool = False
+    has_real_sumo_report: bool = False
+    incumbent_skill_id: Optional[str] = None
+    paired_eval_passed: bool = False
+    accepted_for_deployment: bool = False
+    deployment_rejection_reason: Optional[str] = None
+
     def __post_init__(self):
         if not self.created_at:
             self.created_at = datetime.now(timezone.utc).isoformat()
@@ -49,6 +59,9 @@ class ArchiveEntry:
             self.code_hash = hashlib.sha256(self.code.encode("utf-8")).hexdigest()
         if not self.prompt_hash and self.prompt:
             self.prompt_hash = hashlib.sha256(self.prompt.encode("utf-8")).hexdigest()
+        # 自动推断 has_real_sumo_report
+        if self.sumo_report and not self.has_real_sumo_report:
+            self.has_real_sumo_report = self._check_real_sumo_report()
 
     def to_dict(self) -> dict:
         d = {
@@ -69,6 +82,14 @@ class ArchiveEntry:
             "selected": self.selected,
             "rejection_reason": self.rejection_reason,
             "created_at": self.created_at,
+            # 部署状态硬字段
+            "is_archive_candidate": self.is_archive_candidate,
+            "is_deployable_champion": self.is_deployable_champion,
+            "has_real_sumo_report": self.has_real_sumo_report,
+            "incumbent_skill_id": self.incumbent_skill_id,
+            "paired_eval_passed": self.paired_eval_passed,
+            "accepted_for_deployment": self.accepted_for_deployment,
+            "deployment_rejection_reason": self.deployment_rejection_reason,
         }
         return d
 
@@ -92,6 +113,14 @@ class ArchiveEntry:
             selected=d.get("selected", False),
             rejection_reason=d.get("rejection_reason", ""),
             created_at=d.get("created_at", ""),
+            # 部署状态硬字段（向后兼容：旧 manifest 缺少这些字段时使用默认值）
+            is_archive_candidate=d.get("is_archive_candidate", True),
+            is_deployable_champion=d.get("is_deployable_champion", False),
+            has_real_sumo_report=d.get("has_real_sumo_report", False),
+            incumbent_skill_id=d.get("incumbent_skill_id"),
+            paired_eval_passed=d.get("paired_eval_passed", False),
+            accepted_for_deployment=d.get("accepted_for_deployment", False),
+            deployment_rejection_reason=d.get("deployment_rejection_reason"),
         )
 
     def to_json(self, indent: int = 2) -> str:
@@ -149,6 +178,69 @@ class ArchiveEntry:
             "seed": report.seed,
             "n_seeds": report.n_seeds,
         }
+        # 更新 has_real_sumo_report 标记
+        self.has_real_sumo_report = self._check_real_sumo_report()
+
+    def _check_real_sumo_report(self) -> bool:
+        """判断 sumo_report 是否为真实评估结果。
+
+        真实评估的标志：
+        - sumo_report 存在
+        - score 不为 0（0 表示未评估或占位值）
+        - metrics 非空（至少有实际仿真数据）
+        - total_steps 不为 0
+        """
+        report = self.sumo_report
+        if report is None:
+            return False
+
+        # total_steps 为 0 表示未真正评估
+        if report.get("total_steps", 0) == 0:
+            return False
+
+        score = report.get("score", 0.0)
+        # score=0.0 且 metrics 为空 → 占位报告
+        if score == 0.0 and not report.get("metrics"):
+            return False
+
+        # score 为 inf → 评估失败的报告
+        if score == float("inf"):
+            return False
+
+        # 有 metrics 且 score 不为 0 → 真实报告
+        if report.get("metrics"):
+            return True
+
+        # score 非 0 但无 metrics → 可能是简化报告，仍算真实
+        return score != 0.0
+
+    def mark_deployable_champion(
+        self,
+        incumbent_skill_id: Optional[str] = None,
+    ) -> None:
+        """将此条目标记为可部署 champion。"""
+        self.is_deployable_champion = True
+        self.accepted_for_deployment = True
+        self.is_archive_candidate = True
+        self.paired_eval_passed = True
+        self.has_real_sumo_report = self._check_real_sumo_report()
+        if incumbent_skill_id is not None:
+            self.incumbent_skill_id = incumbent_skill_id
+        # 清除之前的拒绝原因
+        self.deployment_rejection_reason = None
+
+    def mark_rejected(
+        self,
+        reason: str,
+        incumbent_skill_id: Optional[str] = None,
+    ) -> None:
+        """将此条目标记为被拒绝的候选。"""
+        self.is_deployable_champion = False
+        self.accepted_for_deployment = False
+        self.deployment_rejection_reason = reason
+        self.paired_eval_passed = False
+        if incumbent_skill_id is not None:
+            self.incumbent_skill_id = incumbent_skill_id
 
 
 # ---------------------------------------------------------------------------

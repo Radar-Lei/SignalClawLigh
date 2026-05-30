@@ -1,0 +1,42 @@
+{
+  "FixedTime": {
+    "method": "FixedTime",
+    "avg_queue": 1.0134063964709126,
+    "avg_waiting_time": 163.01944122569847,
+    "completed_vehicles": 7767,
+    "avg_travel_time": 372.8166602291747,
+    "total_stops": 1470250
+  },
+  "MaxPressure-CyclicAllocation": {
+    "method": "MaxPressure-CyclicAllocation",
+    "avg_queue": 0.9224269368624207,
+    "avg_waiting_time": 150.10650209950376,
+    "completed_vehicles": 7859,
+    "avg_travel_time": 359.5034991729228,
+    "total_stops": 1338257
+  },
+  "MaxPressure-Canonical": {
+    "method": "MaxPressure-Canonical",
+    "avg_queue": 0.9224269368624207,
+    "avg_waiting_time": 150.10650209950376,
+    "completed_vehicles": 7859,
+    "avg_travel_time": 359.5034991729228,
+    "total_stops": 1338257
+  },
+  "MaxPressure-SwitchLossAware": {
+    "method": "MaxPressure-SwitchLossAware",
+    "avg_queue": 0.9157003032809484,
+    "avg_waiting_time": 154.80123743232792,
+    "completed_vehicles": 7758,
+    "avg_travel_time": 364.73897911832944,
+    "total_stops": 1328498
+  },
+  "SignalClaw-Seed": {
+    "method": "SignalClaw-Seed",
+    "avg_queue": 0.9710325337744693,
+    "avg_waiting_time": 153.33763985082578,
+    "completed_vehicles": 7508,
+    "avg_travel_time": 361.7577250932339,
+    "total_stops": 1408774
+  }
+}

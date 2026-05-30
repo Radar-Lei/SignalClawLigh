@@ -78,6 +78,82 @@ def build_network_constraints(
     return NetworkConstraints(intersections=intersections)
 
 
+def _try_create_sumo_evaluator(scenario_catalog, network_constraints):
+    """尝试创建 SUMOEvaluator，失败时 graceful fallback 到 None。
+
+    SUMOEvaluator 需要三个关键依赖：
+    1. scenario_catalog 中至少有一个带有有效 sumocfg_file 的场景
+    2. 从 sumocfg 或 net.xml 构建 NeighborGraph
+    3. SUMO/TraCI 可用
+
+    任何一个条件不满足时，安全返回 None，进化流程将只使用 ReplayEvaluator。
+    """
+    if scenario_catalog is None:
+        print("[evolution] 无场景目录，跳过 SUMO 评估器创建")
+        return None
+
+    try:
+        from signalclaw.evolution.evaluator_sumo import SUMOEvaluator
+        from signalclaw.network.neighbor_graph import NeighborGraph
+    except ImportError as e:
+        print(f"[evolution] SUMO 依赖未安装，跳过 SUMO 评估: {e}")
+        return None
+
+    # 查找第一个有效的 sumocfg 文件
+    sumocfg_path = None
+    for entry in scenario_catalog:
+        if entry.sumocfg_file and os.path.exists(entry.sumocfg_file):
+            sumocfg_path = entry.sumocfg_file
+            break
+
+    if sumocfg_path is None:
+        print("[evolution] 场景目录中无有效的 sumocfg 文件，跳过 SUMO 评估器创建")
+        return None
+
+    # 尝试从 net.xml 构建 NeighborGraph
+    neighbor_graph = None
+    try:
+        # 从 sumocfg 中提取 net_file 路径
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(sumocfg_path)
+        root = tree.getroot()
+        net_file = None
+        for input_elem in root.iter("input"):
+            for net_elem in input_elem.iter("net-file"):
+                net_file = net_elem.get("value")
+                break
+
+        if net_file:
+            # net_file 可能是相对路径，需要相对于 sumocfg 所在目录解析
+            if not os.path.isabs(net_file):
+                net_file = os.path.join(os.path.dirname(sumocfg_path), net_file)
+
+            if os.path.exists(net_file):
+                neighbor_graph = NeighborGraph.from_sumo_net(net_file)
+                print(f"[evolution] 从 {net_file} 构建邻居拓扑图成功")
+            else:
+                print(f"[evolution] net.xml 文件不存在: {net_file}")
+    except Exception as e:
+        print(f"[evolution] 构建邻居拓扑图失败: {e}")
+
+    if neighbor_graph is None:
+        # 创建空的 NeighborGraph 作为 fallback
+        neighbor_graph = NeighborGraph()
+        print("[evolution] 使用空邻居拓扑图（无路网拓扑信息）")
+
+    try:
+        evaluator = SUMOEvaluator(
+            sumocfg_path=sumocfg_path,
+            neighbor_graph=neighbor_graph,
+            constraints=network_constraints,
+        )
+        print(f"[evolution] SUMO 评估器创建成功（sumocfg={sumocfg_path}）")
+        return evaluator
+    except Exception as e:
+        print(f"[evolution] SUMO 评估器创建失败，将使用纯 Replay 评估: {e}")
+        return None
+
+
 def run_evolution(
     cohort_path: str,
     archive_dir: str,
@@ -160,7 +236,10 @@ def run_evolution(
     prompt_builder = PromptBuilder(sql_profile=sql_profile)
     ast_sandbox = ASTSandbox()
     archive = SkillArchive(archive_dir)
-    selector = SkillSelector()
+
+    # 创建 SUMOEvaluator（graceful fallback：SUMO 未安装或缺少必要文件时跳过）
+    sumo_evaluator = _try_create_sumo_evaluator(scenario_catalog, network_constraints)
+    selector = SkillSelector(sumo_evaluator=sumo_evaluator)
 
     # ---- 6. 对每个路口运行进化 ----
     results = {}
@@ -202,11 +281,13 @@ def run_evolution(
             prompt_builder=prompt_builder,
             ast_sandbox=ast_sandbox,
             replay_evaluator=replay_evaluator,
+            sumo_evaluator=sumo_evaluator,
             archive=archive,
             selector=selector,
             constraints=constraints,
             phase_count=inferred_phase_count,
             sql_profile=sql_profile,
+            cohort=cohort,
         )
 
         # 运行进化
