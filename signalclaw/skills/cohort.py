@@ -15,6 +15,43 @@ from signalclaw.skills.artifact import SkillArtifact
 logger = logging.getLogger(__name__)
 
 
+def _find_project_root() -> Optional[Path]:
+    """从 cwd 向上查找含有 .git 或 pyproject.toml 的目录作为项目根目录。"""
+    current = Path.cwd()
+    for parent in [current] + list(current.parents):
+        if (parent / ".git").exists() or (parent / "pyproject.toml").exists():
+            return parent
+    return None
+
+
+def _resolve_path(raw_path: str) -> str:
+    """解析 skill 路径，支持绝对路径和 repo-relative 相对路径。
+
+    解析策略：
+    1. 绝对路径且文件存在 → 直接使用
+    2. 相对路径 → 先尝试相对于 cwd
+    3. 不存在 → 尝试相对于项目根目录
+    4. 都不存在 → 保持原路径（让后续 FileNotFoundError 报错）
+    """
+    p = Path(raw_path)
+    # 绝对路径且存在，直接使用
+    if p.is_absolute() and p.exists():
+        return raw_path
+    # 相对路径：先尝试 cwd
+    if not p.is_absolute():
+        cwd_resolved = Path.cwd() / p
+        if cwd_resolved.exists():
+            return str(cwd_resolved)
+        # 再尝试项目根目录
+        project_root = _find_project_root()
+        if project_root is not None:
+            root_resolved = project_root / p
+            if root_resolved.exists():
+                return str(root_resolved)
+    # 无法解析，保持原路径
+    return raw_path
+
+
 @dataclass
 class SkillCohort:
     """一组跨交叉口的 skill 集合，每个交叉口包含一个 cycle + 一个 phase skill。"""
@@ -88,7 +125,7 @@ class SkillCohort:
         if skill_type not in entry:
             raise KeyError(f"Skill type {skill_type} not found for crossing {crossing_id}")
 
-        artifact_dir = entry[skill_type]
+        artifact_dir = _resolve_path(entry[skill_type])
         obj = load_skill(artifact_dir)
         self._cache[cache_key] = obj
         return obj
@@ -104,7 +141,8 @@ class SkillCohort:
         result = []
         for crossing_id, types in self.skills.items():
             for skill_type, path in types.items():
-                result.append(load_artifact(path))
+                resolved = _resolve_path(path)
+                result.append(load_artifact(resolved))
         return result
 
     def filter_deployable(
