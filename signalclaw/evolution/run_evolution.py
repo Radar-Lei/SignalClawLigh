@@ -2,7 +2,7 @@
 
 运行所有路口的 GLM 离线进化流程。
 
-两种运行模式：
+三种运行模式：
 1. deployable 模式（默认，--require-sumo-for-champion）：
    - 必须有 SUMO evaluator，否则直接报错
    - 使用 SealedSUMOEvaluator 做 paired evaluation
@@ -12,6 +12,17 @@
    - 不要求 SUMO evaluator，可以没有
    - 候选只保存到 archive，不写 deployable evolved_cohort.json
    - 适合开发调试、离线分析
+
+3. tournament 模式（--tournament）：
+   - 使用 SealedTournament 候选池+锦标赛进化
+   - GLM 每轮生成 30 个候选，经过 AST/behavior/replay/micro-SUMO/paired-SUMO
+     多级筛选，只有通过 non-degradation gate 的才能成为 champion
+   - 输出 tournament_stats.json 记录每个路口的 TournamentResult
+
+4. tournament + cohort-search 模式（--tournament --cohort-search）：
+   - 在 tournament 完成后，自动运行全网 cohort 组合搜索
+   - 验证 champion 组合在全网尺度上不退化（防止局部变好推拥堵给下游）
+   - 支持 greedy 和 beam 两种搜索策略
 
 用法:
     # deployable 模式（默认）
@@ -26,6 +37,22 @@
         --cohort artifacts/skills/cohorts/seed_cohort.json \\
         --archive-dir artifacts/evolution_archive \\
         --archive-only
+
+    # tournament 模式
+    python -m signalclaw.evolution.run_evolution \\
+        --cohort artifacts/skills/cohorts/seed_cohort.json \\
+        --archive-dir artifacts/evolution_archive \\
+        --tournament \\
+        --tournament-candidates 30 \\
+        --tournament-rounds 3
+
+    # tournament + cohort-search 模式（全网组合搜索）
+    python -m signalclaw.evolution.run_evolution \\
+        --cohort artifacts/skills/cohorts/seed_cohort.json \\
+        --archive-dir artifacts/evolution_archive \\
+        --tournament \\
+        --cohort-search \\
+        --search-strategy greedy
 """
 
 from __future__ import annotations
@@ -45,12 +72,18 @@ if _project_root not in sys.path:
 from signalclaw.core.constraints import IntersectionConstraints, NetworkConstraints
 from signalclaw.evolution.archive import ArchiveEntry, SkillArchive
 from signalclaw.evolution.ast_sandbox import ASTSandbox
+from signalclaw.evolution.dsl_compiler import DslCompiler
 from signalclaw.evolution.evaluator_replay import ReplayEvaluator
 from signalclaw.evolution.feature_mask import DEFAULT_FEATURE_MASK, FeatureMask
 from signalclaw.evolution.glm_mutator import GLMSkillMutator
 from signalclaw.evolution.per_intersection import PerIntersectionEvolver
 from signalclaw.evolution.prompt_builder import PromptBuilder
 from signalclaw.evolution.selector import SkillSelector
+from signalclaw.evolution.tournament import SealedTournament, TournamentConfig, TournamentResult
+from signalclaw.evolution.cohort_search import (
+    CohortSearch, CohortSearchConfig, CohortSearchResult,
+    build_candidates_from_tournament, save_champion_cohort,
+)
 from signalclaw.reference.profile_schema import SQLReferenceProfile
 from signalclaw.reference.sql_profiler import SQLReferenceProfiler
 from signalclaw.skills.artifact import SkillArtifact
@@ -188,6 +221,17 @@ def run_evolution(
     sql_profile_path: Optional[str] = None,
     scenario_catalog_path: Optional[str] = None,
     archive_only: bool = False,
+    tournament: bool = False,
+    tournament_candidates: int = 30,
+    tournament_rounds: int = 3,
+    tournament_top_k_micro: int = 10,
+    tournament_top_k_paired: int = 3,
+    tournament_micro_duration: float = 600.0,
+    tournament_full_duration: float = 3600.0,
+    cohort_search: bool = False,
+    cohort_search_strategy: str = "greedy",
+    cohort_search_beam_width: int = 3,
+    cohort_search_threshold: float = 0.02,
 ) -> Dict:
     """运行所有路口的进化。
 
@@ -285,6 +329,35 @@ def run_evolution(
         )
 
     selector = SkillSelector(sumo_evaluator=sumo_evaluator)
+
+    # ---- 路由到 tournament 模式 ----
+    if tournament:
+        return _run_tournament_mode(
+            cohort=cohort,
+            archive_dir=archive_dir,
+            glm_mutator=glm_mutator,
+            prompt_builder=prompt_builder,
+            ast_sandbox=ast_sandbox,
+            archive=archive,
+            selector=selector,
+            sumo_evaluator=sumo_evaluator,
+            network_constraints=network_constraints,
+            sql_profile=sql_profile,
+            feature_mask=feature_mask,
+            crossing_filter=crossing_filter,
+            phase_count=phase_count,
+            tournament_candidates=tournament_candidates,
+            tournament_rounds=tournament_rounds,
+            tournament_top_k_micro=tournament_top_k_micro,
+            tournament_top_k_paired=tournament_top_k_paired,
+            tournament_micro_duration=tournament_micro_duration,
+            tournament_full_duration=tournament_full_duration,
+            cohort_search=cohort_search,
+            cohort_search_strategy=cohort_search_strategy,
+            cohort_search_beam_width=cohort_search_beam_width,
+            cohort_search_threshold=cohort_search_threshold,
+            scenario_catalog=scenario_catalog,
+        )
 
     # ---- 6. 对每个路口运行进化 ----
     results = {}
@@ -425,7 +498,415 @@ def run_evolution(
     return results
 
 
-def _infer_phase_count(code: str, default: int = 4) -> int:
+def _run_tournament_mode(
+    cohort: SkillCohort,
+    archive_dir: str,
+    glm_mutator: GLMSkillMutator,
+    prompt_builder: PromptBuilder,
+    ast_sandbox: ASTSandbox,
+    archive: SkillArchive,
+    selector: SkillSelector,
+    sumo_evaluator,
+    network_constraints: NetworkConstraints,
+    sql_profile: Optional[SQLReferenceProfile],
+    feature_mask: FeatureMask,
+    crossing_filter: Optional[list],
+    phase_count: int,
+    tournament_candidates: int,
+    tournament_rounds: int,
+    tournament_top_k_micro: int,
+    tournament_top_k_paired: int,
+    tournament_micro_duration: float,
+    tournament_full_duration: float,
+    cohort_search: bool = False,
+    cohort_search_strategy: str = "greedy",
+    cohort_search_beam_width: int = 3,
+    cohort_search_threshold: float = 0.02,
+    scenario_catalog=None,
+) -> Dict:
+    """Tournament 模式：使用 SealedTournament 候选池+锦标赛进化。"""
+    print("\n[evolution] ========== TOURNAMENT 模式 ==========")
+    print(f"[evolution] candidates_per_round={tournament_candidates}")
+    print(f"[evolution] max_rounds={tournament_rounds}")
+    print(f"[evolution] top_k_micro={tournament_top_k_micro}, top_k_paired={tournament_top_k_paired}")
+    print(f"[evolution] micro_duration={tournament_micro_duration}s, full_duration={tournament_full_duration}s")
+
+    dsl_compiler = DslCompiler(feature_mask=feature_mask)
+
+    tournament_config = TournamentConfig(
+        candidates_per_round=tournament_candidates,
+        micro_sim_duration=tournament_micro_duration,
+        full_sim_duration=tournament_full_duration,
+        max_rounds=tournament_rounds,
+        top_k_micro=tournament_top_k_micro,
+        top_k_paired=tournament_top_k_paired,
+        use_dsl=True,
+    )
+
+    crossing_ids = sorted(cohort.skills.keys())
+    if crossing_filter:
+        crossing_ids = [cid for cid in crossing_ids if cid in crossing_filter]
+
+    # 每个路口、每种 skill 类型的 tournament 结果
+    all_tournament_results: Dict[str, dict] = {}
+    # champion 跟踪（用于构建 evolved cohort）
+    champions: Dict[str, dict] = {}
+
+    for idx, crossing_id in enumerate(crossing_ids):
+        print(f"\n[evolution] === 路口 {crossing_id} ({idx + 1}/{len(crossing_ids)}) ===")
+
+        skill_dirs = cohort.skills[crossing_id]
+        cycle_dir = skill_dirs.get("cycle", "")
+        phase_dir = skill_dirs.get("phase", "")
+
+        if not cycle_dir or not phase_dir:
+            print(f"[evolution] 跳过 {crossing_id}: 缺少 cycle 或 phase skill")
+            continue
+
+        try:
+            seed_cycle_code = load_skill_code(cycle_dir)
+            seed_phase_code = load_skill_code(phase_dir)
+        except FileNotFoundError as e:
+            print(f"[evolution] 跳过 {crossing_id}: {e}")
+            continue
+
+        inferred_phase_count = _infer_phase_count(seed_cycle_code, phase_count)
+        constraints = network_constraints.get(crossing_id)
+        replay_evaluator = ReplayEvaluator(constraints)
+
+        crossing_results = {}
+        incumbent_cycle_code = seed_cycle_code
+        incumbent_phase_code = seed_phase_code
+
+        for skill_type in ("cycle", "phase"):
+            print(f"\n[evolution] --- {crossing_id}/{skill_type} tournament ---")
+
+            paired_code = incumbent_cycle_code if skill_type == "phase" else None
+
+            tournament = SealedTournament(
+                crossing_id=crossing_id,
+                skill_type=skill_type,
+                config=tournament_config,
+                glm_mutator=glm_mutator,
+                prompt_builder=prompt_builder,
+                ast_sandbox=ast_sandbox,
+                replay_evaluator=replay_evaluator,
+                archive=archive,
+                selector=selector,
+                constraints=constraints,
+                phase_count=inferred_phase_count,
+                dsl_compiler=dsl_compiler,
+                sumo_evaluator=sumo_evaluator,
+                cohort=cohort,
+                sql_profile=sql_profile,
+                feature_mask=feature_mask,
+                paired_skill_code=paired_code,
+            )
+
+            seed_code = seed_cycle_code if skill_type == "cycle" else seed_phase_code
+            incumbent_code = (
+                incumbent_cycle_code
+                if skill_type == "cycle"
+                else incumbent_phase_code
+            )
+
+            # 多轮 tournament
+            best_result = None
+            for round_num in range(1, tournament_rounds + 1):
+                print(
+                    f"[tournament] {crossing_id}/{skill_type} "
+                    f"round {round_num}/{tournament_rounds}"
+                )
+                try:
+                    result = tournament.run(
+                        seed_code=seed_code,
+                        incumbent_code=incumbent_code,
+                        round_num=round_num,
+                    )
+                    best_result = result
+
+                    if result.champion_id:
+                        print(
+                            f"[tournament] round {round_num} champion: "
+                            f"{result.champion_id} (score={result.champion_score})"
+                        )
+                        # 更新 incumbent 为 champion
+                        champion_entry = tournament.incumbent
+                        if champion_entry and champion_entry.code:
+                            incumbent_code = champion_entry.code
+                    else:
+                        print(
+                            f"[tournament] round {round_num}: 无新 champion，保持 incumbent"
+                        )
+
+                except Exception as e:
+                    print(f"[tournament] round {round_num} 异常: {e}")
+                    break
+
+            if best_result is not None:
+                crossing_results[skill_type] = best_result.to_dict()
+
+                # 记录 champion entry
+                champion_entry = tournament.incumbent
+                if champion_entry and champion_entry.accepted_for_deployment:
+                    if skill_type == "cycle":
+                        incumbent_cycle_code = champion_entry.code
+                    else:
+                        incumbent_phase_code = champion_entry.code
+
+        # 保存路口的 tournament 统计
+        all_tournament_results[crossing_id] = crossing_results
+
+        # 记录 champion 信息用于 evolved cohort
+        champions[crossing_id] = {
+            "cycle_code": incumbent_cycle_code,
+            "phase_code": incumbent_phase_code,
+            "cycle_is_seed": incumbent_cycle_code == seed_cycle_code,
+            "phase_is_seed": incumbent_phase_code == seed_phase_code,
+        }
+
+    # ---- 保存 tournament_stats.json ----
+    stats_path = os.path.join(archive_dir, "tournament_stats.json")
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(all_tournament_results, f, indent=2, ensure_ascii=False)
+    print(f"\n[evolution] Tournament stats 保存到: {stats_path}")
+
+    # ---- 保存 evolved cohort ----
+    evolved_skills = {}
+    all_accepted = True
+    for crossing_id, champ_info in champions.items():
+        cycle_is_seed = champ_info["cycle_is_seed"]
+        phase_is_seed = champ_info["phase_is_seed"]
+
+        if cycle_is_seed and phase_is_seed:
+            # 两个都是 seed，使用原始 skill 目录
+            evolved_skills[crossing_id] = cohort.skills[crossing_id]
+            all_accepted = False
+        else:
+            # 至少一个有进化结果，保存 evolved skill
+            # 使用 archive 中已有的 _save_evolved_skill 逻辑
+            cycle_entry = archive.get_best(crossing_id, "cycle")
+            phase_entry = archive.get_best(crossing_id, "phase")
+
+            cycle_dir_out = _save_evolved_skill(
+                archive_dir, crossing_id, "cycle",
+                cycle_entry if cycle_entry and cycle_entry.accepted_for_deployment else None,
+            )
+            phase_dir_out = _save_evolved_skill(
+                archive_dir, crossing_id, "phase",
+                phase_entry if phase_entry and phase_entry.accepted_for_deployment else None,
+            )
+
+            if cycle_dir_out and phase_dir_out:
+                evolved_skills[crossing_id] = {
+                    "cycle": cycle_dir_out,
+                    "phase": phase_dir_out,
+                }
+            else:
+                evolved_skills[crossing_id] = cohort.skills[crossing_id]
+                all_accepted = False
+
+    has_any_deployable = any(
+        not info["cycle_is_seed"] or not info["phase_is_seed"]
+        for info in champions.values()
+    )
+    cohort_source = "sealed_tournament_champion" if has_any_deployable else "seed_fallback"
+
+    evolved_cohort = SkillCohort(
+        cohort_id=f"tournament_{cohort.cohort_id}",
+        skills=evolved_skills,
+        frozen=True,
+        glm_used_online=False,
+        exploration=False,
+        created_by="run_evolution.py (tournament mode)",
+        source=cohort_source,
+        all_skills_accepted_for_deployment=all_accepted,
+    )
+    evolved_cohort_path = os.path.join(archive_dir, "evolved_cohort.json")
+    evolved_cohort.save(evolved_cohort_path)
+    print(f"[evolution] Evolved cohort 保存到: {evolved_cohort_path}")
+
+    # ---- 保存摘要 ----
+    archive.save()
+    summary_path = os.path.join(archive_dir, "evolution_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(all_tournament_results, f, indent=2, ensure_ascii=False)
+    print(f"[evolution] 进化摘要保存到: {summary_path}")
+
+    total = len(all_tournament_results)
+    total_candidates = sum(
+        r.get("cycle", {}).get("candidate_count", 0) +
+        r.get("phase", {}).get("candidate_count", 0)
+        for r in all_tournament_results.values()
+        if isinstance(r, dict)
+    )
+    total_champions = sum(
+        r.get("cycle", {}).get("accepted_champion_count", 0) +
+        r.get("phase", {}).get("accepted_champion_count", 0)
+        for r in all_tournament_results.values()
+        if isinstance(r, dict)
+    )
+    print(f"\n[evolution] Tournament 完成: {total} 个路口")
+    print(f"[evolution] 总候选数: {total_candidates}")
+    print(f"[evolution] 总 champion 数: {total_champions}")
+    print(f"[evolution] Archive 总条目: {archive.count()}")
+
+    # ---- Cohort search（可选） ----
+    if cohort_search and total_champions > 0:
+        _run_cohort_search(
+            seed_cohort=cohort,
+            evolved_cohort=evolved_cohort,
+            tournament_stats=all_tournament_results,
+            archive_dir=archive_dir,
+            sumo_evaluator=sumo_evaluator,
+            scenario_catalog=scenario_catalog,
+            strategy=cohort_search_strategy,
+            beam_width=cohort_search_beam_width,
+            degradation_threshold=cohort_search_threshold,
+            sim_duration=tournament_full_duration,
+            seed=42,
+        )
+
+    return all_tournament_results
+
+
+def _run_cohort_search(
+    seed_cohort: SkillCohort,
+    evolved_cohort: SkillCohort,
+    tournament_stats: Dict,
+    archive_dir: str,
+    sumo_evaluator=None,
+    scenario_catalog=None,
+    strategy: str = "greedy",
+    beam_width: int = 3,
+    degradation_threshold: float = 0.02,
+    sim_duration: float = 3600.0,
+    seed: int = 42,
+) -> Optional[CohortSearchResult]:
+    """在 tournament 完成后运行全网 cohort 组合搜索。
+
+    Parameters
+    ----------
+    seed_cohort : SkillCohort
+        seed cohort。
+    evolved_cohort : SkillCohort
+        进化后的 cohort（包含 champion skill）。
+    tournament_stats : Dict
+        tournament_stats.json 内容。
+    archive_dir : str
+        archive 目录路径。
+    sumo_evaluator : optional
+        SUMO evaluator（用于查找 sumocfg 路径）。
+    scenario_catalog : optional
+        场景目录。
+    strategy : str
+        搜索策略 "greedy" 或 "beam"。
+    beam_width : int
+        beam search 宽度。
+    degradation_threshold : float
+        退化阈值。
+    sim_duration : float
+        全网仿真时长。
+    seed : int
+        随机种子。
+
+    Returns
+    -------
+    CohortSearchResult or None
+        搜索结果，如果没有 candidate 或无法创建则返回 None。
+    """
+    print(f"\n[evolution] ========== COHORT SEARCH ==========")
+    print(f"[evolution] 策略: {strategy}, beam_width: {beam_width}")
+
+    # 构建 candidates
+    candidates = build_candidates_from_tournament(
+        tournament_stats=tournament_stats,
+        seed_cohort=seed_cohort,
+        evolved_cohort=evolved_cohort,
+        archive_dir=archive_dir,
+    )
+
+    if not candidates:
+        print("[evolution] 无 champion 候选，跳过 cohort search")
+        return None
+
+    print(f"[evolution] 找到 {len(candidates)} 个 champion 候选路口")
+
+    # 查找 sumocfg 路径
+    sumocfg_path = None
+    if scenario_catalog is not None:
+        for entry in scenario_catalog:
+            if entry.sumocfg_file and os.path.exists(entry.sumocfg_file):
+                sumocfg_path = entry.sumocfg_file
+                break
+
+    if sumocfg_path is None and sumo_evaluator is not None:
+        sumocfg_path = getattr(
+            sumo_evaluator, "_sumocfg_path",
+            getattr(sumo_evaluator, "sumocfg_path", None),
+        )
+
+    if sumocfg_path is None:
+        # fallback: 尝试默认路径
+        project_root = os.path.abspath(os.path.join(archive_dir, "..", ".."))
+        candidate_paths = [
+            os.path.join(project_root, "sumo_scenarios", "chengdu", "chengdu.sumocfg"),
+        ]
+        for p in candidate_paths:
+            if os.path.exists(p):
+                sumocfg_path = p
+                break
+
+    if sumocfg_path is None:
+        print("[evolution] 无法找到 sumocfg 文件，跳过 cohort search")
+        return None
+
+    # 查找 neighbor graph 路径
+    project_root = os.path.abspath(os.path.join(archive_dir, "..", ".."))
+    neighbor_graph_path = os.path.join(
+        project_root, "artifacts", "topology", "one_hop_neighbors.json"
+    )
+
+    # 创建搜索配置
+    config = CohortSearchConfig(
+        beam_width=beam_width,
+        network_sim_duration=sim_duration,
+        degradation_threshold=degradation_threshold,
+        seed=seed,
+        strategy=strategy,
+    )
+
+    # 创建搜索器并执行
+    searcher = CohortSearch(
+        config=config,
+        candidates=candidates,
+        seed_cohort=seed_cohort,
+        evolved_cohort=evolved_cohort,
+        sumocfg_path=sumocfg_path,
+        neighbor_graph_path=neighbor_graph_path,
+    )
+
+    result = searcher.search()
+
+    # 保存结果
+    result_path = os.path.join(archive_dir, "cohort_search_result.json")
+    result.save(result_path)
+    print(f"[evolution] Cohort search 结果保存到: {result_path}")
+
+    # 保存最终 champion cohort
+    champion_cohort_path = os.path.join(archive_dir, "final_champion_cohort.json")
+    save_champion_cohort(
+        result=result,
+        seed_cohort=seed_cohort,
+        evolved_cohort=evolved_cohort,
+        output_path=champion_cohort_path,
+    )
+    print(f"[evolution] 最终 champion cohort 保存到: {champion_cohort_path}")
+
+    return result
+
+
+
     """从代码中推断相位数量（简单启发式）。"""
     # 尝试从 range(n) 或 range(0, n) 中推断
     import re
@@ -688,6 +1169,79 @@ def main():
              "此参数为默认行为，无需显式指定。",
     )
 
+    # Tournament 模式参数
+    parser.add_argument(
+        "--tournament",
+        action="store_true",
+        default=False,
+        help="使用 SealedTournament 候选池+锦标赛进化模式。"
+             "GLM 每轮生成大量候选，经过多级筛选后只有通过 non-degradation gate "
+             "的才能成为 champion。",
+    )
+    parser.add_argument(
+        "--tournament-candidates",
+        type=int,
+        default=30,
+        help="Tournament 模式下每轮生成的候选数量（默认 30）",
+    )
+    parser.add_argument(
+        "--tournament-rounds",
+        type=int,
+        default=3,
+        help="Tournament 模式下最大进化轮数（默认 3）",
+    )
+    parser.add_argument(
+        "--tournament-top-k-micro",
+        type=int,
+        default=10,
+        help="Tournament 模式下 micro-SUMO 快筛后保留的 top-k（默认 10）",
+    )
+    parser.add_argument(
+        "--tournament-top-k-paired",
+        type=int,
+        default=3,
+        help="Tournament 模式下 paired-SUMO 后保留的 top-k（默认 3）",
+    )
+    parser.add_argument(
+        "--tournament-micro-duration",
+        type=float,
+        default=600.0,
+        help="Tournament 模式下 micro-SUMO 快筛时长（秒，默认 600）",
+    )
+    parser.add_argument(
+        "--tournament-full-duration",
+        type=float,
+        default=3600.0,
+        help="Tournament 模式下 full-SUMO 完整评估时长（秒，默认 3600）",
+    )
+
+    # Cohort search 参数
+    parser.add_argument(
+        "--cohort-search",
+        action="store_true",
+        default=False,
+        help="Tournament 完成后运行全网 cohort 组合搜索，"
+             "验证 cohort 组合在全网尺度上不退化。",
+    )
+    parser.add_argument(
+        "--search-strategy",
+        choices=["greedy", "beam"],
+        default="greedy",
+        help="Cohort search 搜索策略（默认 greedy）",
+    )
+    parser.add_argument(
+        "--search-beam-width",
+        type=int,
+        default=3,
+        help="Beam search 宽度（默认 3，仅 beam 策略有效）",
+    )
+    parser.add_argument(
+        "--search-degradation-threshold",
+        type=float,
+        default=0.02,
+        help="允许全网退化的比例（默认 0.02 即 2%%）",
+    )
+
     args = parser.parse_args()
 
     run_evolution(
@@ -702,6 +1256,17 @@ def main():
         sql_profile_path=args.sql_profile,
         scenario_catalog_path=args.scenario_catalog,
         archive_only=args.archive_only,
+        tournament=args.tournament,
+        tournament_candidates=args.tournament_candidates,
+        tournament_rounds=args.tournament_rounds,
+        tournament_top_k_micro=args.tournament_top_k_micro,
+        tournament_top_k_paired=args.tournament_top_k_paired,
+        tournament_micro_duration=args.tournament_micro_duration,
+        tournament_full_duration=args.tournament_full_duration,
+        cohort_search=args.cohort_search,
+        cohort_search_strategy=args.search_strategy,
+        cohort_search_beam_width=args.search_beam_width,
+        cohort_search_threshold=args.search_degradation_threshold,
     )
 
 
