@@ -1,461 +1,457 @@
-我看完现在 `main` 上的结果和代码后，判断是：**你的怀疑非常合理，但现在不能先说“Max Pressure 理论不如 Fixed Time”，也不能先说“GLM 进化没用”。更像是 baseline 实现、指标口径、闭环执行方式、进化选择压力这四件事混在一起了。**
+对，**你这个要求是必须成立的**：
+进化系统不能只是“生成了一个新 Skill”，而应该是：
 
-当前 `results/summary.json` 里，MaxPressure 并不是所有指标都比 FixedTime 差：它的 `avg_queue`、`max_queue`、`total_throughput`、`avg_travel_time`、`completed_vehicles` 都比 FixedTime 好，但 `avg_waiting_time` 和 `avg_delay` 更差；SignalClaw-Evolved 则确实在 `avg_queue`、`avg_waiting_time`、`avg_delay`、`completed_vehicles` 上比 SignalClaw-Seed 更差，只是在 `avg_travel_time` 上比 Seed 好一些。也就是说，你看到的“有些指标变好，有些反而更差”在当前结果里是成立的。([GitHub][1])
+> **只有通过严格 sealed evaluation 并且统计上不退化的候选，才允许替换当前 champion。否则就保留原 champion。**
 
----
+所以“候选可以变差”，但**champion 不能越进化越差**。现在的问题不是“GLM 没用”，而是进化管线还没有真正实现 **monotonic champion update**。当前结果里，SignalClaw-Evolved 的 `avg_queue=806.01`、`avg_waiting_time=163.61`、`completed_vehicles=7098`，确实明显差于 SignalClaw-Seed 的 `avg_queue=747.61`、`avg_waiting_time=126.89`、`completed_vehicles=7508`；这个不能被包装成成功。([GitHub][1])
 
-## 1. Max Pressure 为什么可能比 Fixed Time 差？
+## 1. 先说 MaxPressure：你说得对，它应该是强 baseline
 
-这里我不建议先从理论上解释，而是先从实现上排查。现在仓库里的 `MaxPressureSkill` 更像是一个 **cycle-based pressure allocation baseline**，不是严格意义上的经典 Max Pressure。代码注释里也写了：它是“all phases are served in order, but green time is allocated proportionally to pressure”的周期式变体。([GitHub][2])
+MaxPressure 大概率应该比 FixedTime 好，至少在拥堵、需求变化、不均衡流量下，它应该在**队列、吞吐、旅行时间**这些主指标上压过普通固定配时。理论上，MaxPressure 的核心优势是基于本地上游/下游队列压力做自适应控制，并有 maximum stability 这类性质；但实际效果会被相位约束、固定周期、切换损失、turning ratio、下游容量建模影响。([科学直达][2])
 
-经典 Max Pressure 的核心通常是：按 movement 或 phase 计算上游队列减下游队列的压力，然后在决策时选择压力最大的相位；已有介绍也把它概括为：每个 movement 的 pressure 是 upstream queue 减 downstream queue，再结合饱和流，路口选择 pressure 最大的相位。([ROSA P][3]) 但当前代码有几个关键偏差。
+你现在仓库里的情况很关键：`max_pressure.py` 已经写了四个变体，包括 `MaxPressureCyclicAllocation`、`MaxPressureQueueOnly`、`MaxPressureCanonical`、`MaxPressureCyclicMovement`，并且 `MaxPressureCanonical` 的注释说它是“每个 decision interval 选择最高 pressure phase，满足 min_green 后才切换”的 classic 版本；但文件最后仍然把 `MaxPressureSkill = MaxPressureCyclicAllocation` 作为 backward-compatible alias。([GitHub][3]) 也就是说，当前默认实验很可能跑的还是**固定相序、按压力分配绿灯的弱化版 MaxPressure**，不是你真正想拿来做强 baseline 的 canonical MaxPressure。runner 默认方法里也确实用的是 `MaxPressureSkill(decision_interval=...)`。([GitHub][4])
 
-第一，当前 `compute_pressure()` 里面的 downstream pressure 是把整个路口的所有 downstream queue 汇总后平均，再作为同一个下游惩罚项影响每个 phase。这不是 movement-specific downstream pressure。结果就是：每个相位真正区分度主要来自 incoming queue，下游拥堵影响反而变成一个全局平移项。([GitHub][2])
-
-第二，当前做法会把所有 phase 的压力平移成正数，然后按比例分配绿灯。这样即使某个 phase 的真实 pressure 是负的，它仍然会拿到至少 `min_green`，这和“选择最大 pressure 相位”的思想不一样。拥堵时这会造成两个副作用：高压相位拿不到足够连续服务，低压相位也被强行服务，等待时间可能变差。([GitHub][2])
-
-第三，runner 里对 MaxPressure / legacy SignalClaw 的执行方式是：**只在进入一个新的绿色相位时调用 `plan_cycle()`，然后只用 `setPhaseDuration()` 改当前绿灯持续时间**。它没有真正让 MaxPressure 在每个 decision interval 上自由选择“下一相位”。这会把 MaxPressure 退化成“固定相序 + 动态配绿”，如果 Fixed Time 本身相序/offset 已经比较适合当前 SUMO 场景，MaxPressure 反而容易破坏原本协调。([GitHub][4])
-
-第四，当前指标口径本身需要先修。runner 每 10 步采一次指标，`throughput` 用的是采样当步的 `getArrivedIDList()`，而 `completed_vehicles` 又来自单独的车辆追踪；`stops` 还是 `int(total_queue * 0.3)` 这种 proxy。这会导致“total_throughput”和“completed_vehicles”不完全一致，当前结果里也确实出现了这种不一致。([GitHub][4])
-
-所以 MaxPressure 的排查优先级应该是：
+所以我建议马上把 baseline 分成这几条线跑清楚：
 
 ```text
-先不要拿现在这个 MaxPressure 当强 baseline 结论。
-先实现一个 canonical / movement-level MaxPressure，再比较。
+FixedTime
+MaxPressure-CyclicAllocation    # 当前默认，保留作历史对照
+MaxPressure-QueueOnly           # 排查 downstream pressure 是否制造噪声
+MaxPressure-Canonical           # 真正强 baseline
+MaxPressure-CyclicMovement      # 固定相序 + movement-level pressure
+SignalClaw-Seed
+SignalClaw-Evolved
 ```
 
-我建议至少做 4 个 MaxPressure 版本：
+验收标准应该写死：
 
 ```text
-MP-Current:
-  现在这个版本，保留作为历史对照。
-
-MP-QueueOnly:
-  只按 phase incoming queue 分配，去掉 downstream 项。
-  用来判断 downstream 计算是否在制造噪声。
-
-MP-CanonicalSelect:
-  每个 decision interval 选择 pressure 最大相位；
-  满足 min_green 后才允许切换；
-  pressure 按 movement-specific upstream - downstream 算。
-
-MP-CyclicPressure:
-  保留固定相序，但每周期只做配绿；
-  downstream 也必须 movement-specific。
+如果 MaxPressure-Canonical 在 avg_queue / completed_vehicles / avg_travel_time 上
+不能稳定好于 FixedTime，
+优先怀疑：
+1. phase ↔ movement mapping 错；
+2. downstream queue 不是 movement-specific；
+3. min_green / yellow / all-red / switching loss 没处理好；
+4. 指标口径有问题；
+5. FixedTime 本身是 SUMO 网络里非常强的预设配时。
 ```
 
-如果 `MP-QueueOnly` 比 `MP-Current` 好，说明当前 downstream pressure 计算有问题。
-如果 `MP-CanonicalSelect` 明显好，说明问题主要是“把 MaxPressure 做成固定相序周期配绿”导致的。
-如果所有 MP 都不如 FixedTime，那才进一步怀疑场景 demand、phase mapping、检测器、路网 offset、黄灯损失和 SUMO 默认配时本身。
+当前结果里，MaxPressure 其实不是全面输 FixedTime：`avg_queue` 从 776.09 降到 705.32，`completed_vehicles` 从 7767 到 7859，`avg_travel_time` 从 372.82 到 359.50；但 `avg_waiting_time` 从 99.53 升到 108.87。([GitHub][1]) 这个现象更像“实现/执行方式/指标口径混合问题”，不是 MaxPressure 理论不行。
 
----
+## 2. 现在 Evolved 变差的根因：不是“进化”，是“没有 champion 门槛”
 
-## 2. 为什么净化 / 进化后的 CycloClaw 会比手写 seed 差？
-
-这个现象我反而觉得很正常。因为当前“进化”已经有目录和 artifact 体系了，但从结果看，**选择压力还没有真正落到 SUMO 闭环交通指标上**。
-
-例如一个 evolved cycle skill 的 manifest 里，`replay_score` 是 0.9434，但 `sumo_score`、`mean_waiting`、`mean_queue`、`throughput` 都还是 0.0。也就是说，这个候选被记录为 frozen/evolved，但它并没有携带真实的 SUMO 闭环性能证据。([GitHub][5])
-
-`evolution_summary.json` 里也能看到 cycle score 有提升，phase score 很多是 1.0；这意味着 phase evaluator 很可能已经饱和，无法区分好坏。([GitHub][6]) 一旦 evaluator 分不出 phase skill 的优劣，LLM 生成出来的“看起来合理”的 phase code 就可能被误选。
-
-还有一个更直接的问题：evolved skill 里用了 `predicted_arrival`，例如 score 里有 `q * 1.0 + arr * 1.5 + wt * 0.2`，但 runner 构造 observation 时 `predicted_arrival=0.0`。([GitHub][7]) 这会造成一个很尴尬的局面：GLM 进化出来的公式以为自己在利用预测到达，但真实闭环里这个信号恒为 0，相当于进化目标和执行环境不一致。
-
-再看 seed skill，它反而有一些“土但稳”的机制：队列、等待、下游 spillback proxy、hunger bonus、历史平滑等。([GitHub][8]) 这些手写启发式可能不漂亮，但对交通控制很重要。LLM 进化如果没有行为回归测试，很容易把这些隐含保护删掉或稀释掉。于是就会出现：AST 过了，replay 分数也不错，但闭环 SUMO 里更差。
-
-还有一个工程层面的风险：`evolved_cohort.json` 里面很多路径是 `/home/samuel/projects/...` 这种绝对路径，而且 cohort 里混用了 evolved skill 和 seed v0000 skill。([GitHub][9]) 这会影响可复现性，也会让实验结果解释变复杂：你以为跑的是全 evolved cohort，实际可能是一部分 evolved、一部分 seed，甚至路径不一致时发生 fallback / load failure。
-
-所以净化后变差的核心原因，我会概括成一句话：
-
-> **现在的净化更像“代码可执行化 / AST 安全化”，还不是“交通行为净化 / 闭环性能净化”。**
-
----
-
-## 3. AST 结构化输出要做，但 AST 不能当最终保险
-
-仓库里已经有 `ASTSandbox`，它会检查危险 import、危险函数、接口、确定性、class、try/except、复杂度等。这个方向是对的。([GitHub][10]) 但是 AST 只能回答：
+现在要把“candidate”和“champion”严格分开。
 
 ```text
-这段代码能不能安全解析？
-有没有明显危险调用？
-接口是不是 plan(obs) / decide(obs, plan)？
+candidate:
+  GLM 生成出来的东西。
+  可以很差，可以失败，可以进入 archive 供分析。
+
+champion:
+  只有真实 SUMO sealed evaluation 通过、
+  并且相对 seed / incumbent 不退化，
+  才能替换线上/实验 cohort。
 ```
 
-它回答不了：
+当前 `selector.py` 的文件注释已经写了“champion candidate 必须有真实 sumo_report、必须和 seed baseline 比较、必须满足硬门槛”，这方向是对的；但它的 `select()` 逻辑仍然写着如果没有 champion，就退回 archive 级候选。([GitHub][5]) 这个 fallback 对“研究 archive”可以，但对“deployable evolved cohort”不行。**没有 champion 时，应该返回 seed/incumbent，而不是返回 archive best。**
+
+更关键的是，`run_evolution.py` 里没有找到 `SUMOEvaluator` 或 `sumo_evaluator`，实际初始化的是 `selector = SkillSelector()`，然后只创建了 `ReplayEvaluator` 并传给 `PerIntersectionEvolver`。([GitHub][6]) 这说明当前进化主路径虽然加载了 scenario catalog，但没有真正把 SUMO 闭环评估作为 candidate 替换 champion 的硬裁判。
+
+所以现在的 Evolved 变差，不奇怪。它本质上是：
 
 ```text
-相位映射是不是错了？
-绿灯分配是不是交通上合理？
-会不会让某个相位长期饥饿？
-会不会破坏下游？
-会不会导致 cycle 波动太大？
-会不会只是在 replay 里好看，SUMO 闭环里变差？
+GLM candidate
+  -> AST / replay / prior
+  -> selector fallback
+  -> evolved cohort
 ```
 
-所以结构化输出应该升级成三层。
-
-第一层是 **JSON schema 输出**，不让 GLM 自由吐代码：
-
-```json
-{
-  "skill_type": "cycle",
-  "version_note": "...",
-  "features_used": [
-    "queue",
-    "waiting_time",
-    "downstream_queue",
-    "hunger_time"
-  ],
-  "parameters": {
-    "w_queue": 1.0,
-    "w_wait": 0.2,
-    "w_downstream": -0.8,
-    "w_hunger": 0.6
-  },
-  "invariants": {
-    "min_green": 10,
-    "max_green": 60,
-    "min_cycle": 40,
-    "max_cycle": 180,
-    "all_phases_served": true
-  },
-  "code": "def plan(obs): ..."
-}
-```
-
-第二层是 **受限 DSL / expression tree**，最好不要一开始就让它写任意 Python。比如周期 skill 只允许表达：
+而不是：
 
 ```text
-phase_score =
-    w_q * queue
-  + w_w * waiting_time
-  + w_arr * predicted_arrival
-  + w_h * hunger
-  - w_down * downstream_spillback
-  - w_switch * switch_penalty
+GLM candidate
+  -> AST / behavior tests
+  -> replay safety
+  -> micro-SUMO
+  -> full SUMO sealed paired evaluation
+  -> non-degradation gate
+  -> champion update
 ```
 
-LLM 可以提出 feature 组合和结构，但最终编译器自己把 DSL 编译成 Python。这样 AST 通过率会高很多，也能防止奇怪语法和动态行为。
+## 3. M.E.T.A. Optimization 应该这样定义
 
-第三层是 **行为契约测试**，这比 AST 更关键：
+我建议你把 **META Optimization** 明确定义成四层，写进项目文档和代码模块名里。
 
 ```text
-队列增加，相位分数不能下降太多。
-某相位长时间未服务，hunger bonus 必须上升。
-下游严重堵塞时，对应放行相位不能继续大幅加绿。
-总绿灯不能超过 cycle 上限。
-所有必须相位都要被服务。
-同一 obs 多次调用输出必须一致。
+M = Measurement
+E = Evolution
+T = Tournament
+A = Archive / Acceptance
 ```
 
-也就是说，净化不能只是：
+### M：Measurement，先把评价函数修成可信的
 
-```text
-LLM rewrite -> AST pass -> 保存
-```
+进化想变好，第一步不是调 prompt，而是修指标。现在 runner 每 10 步采样，`throughput` 用的是当步 `getArrivedIDList()`，`stops` 还是 `int(total_queue * 0.3)` proxy，这会导致 throughput、completed、stops 口径不一致。([GitHub][4])
 
-而应该是：
-
-```text
-LLM/DSL candidate
-  -> schema pass
-  -> AST pass
-  -> unit tests pass
-  -> behavioral contract pass
-  -> replay safety pass
-  -> micro-SUMO pass
-  -> full-SUMO sealed pass
-  -> 才能进入 champion
-```
-
----
-
-## 4. META Optimization 应该怎么用？
-
-我建议把“Meta Optimization”分成两类：**LLM 结构搜索** 和 **数值参数优化**。不要让 LLM 同时负责所有事情。
-
-FunSearch 和 AlphaEvolve 的共同点不是“相信大模型写的程序”，而是：LLM 只是生成候选程序，真正的裁判是自动 evaluator 和进化式筛选。FunSearch 明确是让程序能被自动运行和评估，再保留高分程序继续进化；AlphaEvolve 也是把 LLM 的代码生成能力和自动 evaluator 结合，在进化框架里改进候选。([Google DeepMind][11])
-
-OPRO 的思想也可以借鉴：把历史候选和分数放进 prompt，让 LLM 基于“之前哪些方案得分高/低”提出下一批候选，而不是单轮让它凭空写一个最优算法。([arXiv][12]) TextGrad 则更像把 evaluator 的文字反馈反传给候选组件，用文本反馈来优化复杂 AI 系统。([arXiv][13])
-
-落到 SignalClaw / CycloClaw，我建议这样做：
-
-```text
-LLM 负责：
-  1. 提出新的评分公式结构
-  2. 增删 feature
-  3. 根据失败案例修复规则
-  4. 解释为什么某个指标变差
-  5. 生成 DSL / patch，而不是随意生成整文件 Python
-
-非 LLM optimizer 负责：
-  1. 调 w_queue / w_wait / w_downstream / w_hunger 等连续参数
-  2. 用 Bayesian Optimization / CMA-ES / grid search 做小维度搜索
-  3. 用 Pareto front 选 champion
-  4. 用 sealed SUMO evaluator 做最终裁判
-```
-
-最实用的进化闭环应该是：
-
-```text
-Seed Skill
-  ↓
-LLM 生成 20 个结构变体
-  ↓
-AST + DSL + unit tests 筛掉 70%
-  ↓
-Replay safety 筛掉 50%
-  ↓
-参数优化器给剩下候选调权重
-  ↓
-micro-SUMO 快速评估
-  ↓
-full-SUMO 多 seed / 多 demand sealed 评估
-  ↓
-Pareto selector 选 champion
-  ↓
-失败案例进入 archive，下一轮 prompt 使用
-```
-
-这里的关键是：**LLM 不当裁判，LLM 只当 proposal generator。**
-
----
-
-## 5. 不能完全依靠大模型，这点你判断是对的
-
-这个项目里，大模型一定要用，但不应该“完全依靠大模型”。正确分工应该是：
-
-```text
-大模型：
-  负责产生候选结构、解释失败、做局部 patch、组合已有策略。
-
-AST / DSL / schema：
-  负责保证代码形态、接口、安全性、可解析性。
-
-传统优化器：
-  负责调连续参数和阈值。
-
-SUMO evaluator：
-  负责判断真实闭环交通表现。
-
-Safety layer：
-  负责保证上线执行永远不越界。
-
-Archive / Pareto selector：
-  负责避免只看单指标，避免回退。
-```
-
-这也和我们之前定的方向一致：**离线 LLM 进化 Skill，在线只执行冻结后的确定性 Skill，不在线调用大模型，不在线探索动作空间。** 
-
-尤其交通信号控制不能只看一个 score。下一版 selector 不应该只按 replay score 排，应该强制加门槛：
-
-```text
-硬门槛：
-  AST 必须过
-  unit tests 必须过
-  safety violations = 0
-  phase starvation = 0
-  sumo_score 必须是真实评估，不允许 0/空
-  completed_vehicles 不得比 seed 下降超过 1% 或 2%
-  avg_waiting 不得比 seed 上升超过 3% 或 5%
-  avg_queue 不得比 seed 上升超过 3% 或 5%
-  safety_clip_count 不得显著增加
-
-软目标：
-  avg_travel_time 越低越好
-  avg_waiting 越低越好
-  avg_queue 越低越好
-  throughput/completed 越高越好
-  downstream spillback 越低越好
-  cycle volatility 越低越好
-  code complexity 越低越好
-```
-
-当前 selector 里已经有多目标权重的雏形，但它的核心还是 replay score、复杂度、安全违规、starvation、以及如果有 sumo_report 才加入 SUMO 分。([GitHub][14]) 下一步应该把 `sumo_report` 变成 champion 的必需条件，而不是 optional bonus。
-
----
-
-## 6. 我建议下一轮马上做的排查与改造
-
-### A. 先把指标修干净
-
-先不要继续争论谁优谁劣。当前 `total_throughput`、`completed_vehicles`、`stops` 口径不一致。建议统一成：
+必须改成：
 
 ```text
 completed_vehicles:
-  SUMO arrived vehicle count / tripinfo count
+  SUMO tripinfo / arrived vehicle count
 
 throughput_per_hour:
   completed_vehicles / simulated_hours
 
 avg_travel_time:
-  completed vehicles 的真实 travel time 均值
+  completed vehicles 的真实 trip duration
 
 avg_waiting_time:
-  tripinfo waitingTime，或者明确说明是 lane-level sample waiting
+  tripinfo waitingTime，或明确声明 lane-level waiting sample
 
 avg_queue:
-  每 step / 每 lane halting number 的时间平均
+  每 step、每 lane halting number 的时间平均
 
 total_stops:
-  如果 SUMO tripinfo 有 stops 就用真实 stops；
-  不要用 int(queue * 0.3) 当最终结论指标。
+  优先 SUMO tripinfo stops；
+  不要用 queue * 0.3 作为最终论文指标
 ```
 
-否则 MaxPressure 和 Evolved 的优劣很容易被指标口径误导。
+没有 Measurement integrity，META 会优化错目标。
 
-### B. 重写 MaxPressure baseline
+### E：Evolution，LLM 只负责提案，不负责裁判
 
-把现在这个版本保留叫 `MaxPressure-CyclicAllocation`，再新加：
+FunSearch 和 AlphaEvolve 的共同点不是“相信大模型”，而是**大模型生成候选程序，自动 evaluator 做裁判，进化框架保留高分候选**。FunSearch 让候选以程序形式表达，从而可以自动运行和评估；AlphaEvolve 也是把 LLM 的代码生成能力和自动 evaluator 结合，用进化框架改进候选。([Google DeepMind][7])
+
+在 SignalClaw 里，LLM 的职责应该是：
 
 ```text
-MaxPressure-Canonical:
-  movement-level pressure
-  decision interval 级选择相位
-  min_green 后允许切换
-  yellow/all-red 交给 SUMO 或明确建模
-
-MaxPressure-CyclicMovement:
-  固定相序
-  movement-level pressure
-  只做周期配绿
+1. 生成新的评分公式结构；
+2. 增删 feature；
+3. 根据失败案例修 patch；
+4. 总结为什么某类场景失败；
+5. 输出 DSL / patch，而不是随意输出整文件 Python。
 ```
 
-然后用 5 个 seed 跑：
+非 LLM optimizer 负责：
+
+```text
+1. 调 w_queue / w_wait / w_downstream / w_hunger 等连续参数；
+2. 用 grid search / CMA-ES / Bayesian optimization 做小维度调参；
+3. 用 Pareto selector 选候选；
+4. 用 SUMO sealed evaluator 做最终裁判。
+```
+
+你之前材料里也已经把方向定得很清楚：离线进化应是“LLM 代码进化 + 自动评估器 + 多目标选择 + 参数优化”，候选要过静态检查、历史 SQL 回放、SUMO 批量仿真、多目标排序和归档。
+
+### T：Tournament，用成对场景锦标赛替代单次分数
+
+不能让一个候选因为单个 run 运气好就替换 seed。要做 paired tournament：
+
+```text
+同一个 traffic_input_hash
+同一个 route/demand seed
+同一个 detector_noise seed
+同一个 incident seed
+同一个 time window
+
+Seed / Incumbent 跑一遍
+Candidate 跑一遍
+比较 delta
+```
+
+每个 candidate 至少跑：
+
+```text
+micro-SUMO:
+  1 个 ego intersection + one-hop neighbors
+  8~20 个短场景
+
+full-SUMO:
+  全网或 corridor
+  5 个随机 seed
+  peak / offpeak / high_demand / low_demand / incident
+```
+
+然后用硬门槛：
+
+```text
+candidate.completed_vehicles >= incumbent.completed_vehicles * 0.99
+candidate.avg_waiting_time <= incumbent.avg_waiting_time * 1.03
+candidate.avg_queue <= incumbent.avg_queue * 1.03
+candidate.safety_violations == 0
+candidate.phase_starvation == 0
+candidate.safety_clip_count 不显著增加
+```
+
+再用软目标排序：
+
+```text
+J =
+  1.0 * normalized_waiting
++ 1.0 * normalized_queue
++ 0.6 * normalized_travel_time
+- 0.8 * normalized_completed_vehicles
++ 2.0 * safety_penalty
++ 1.5 * spillback_penalty
++ 1.0 * starvation_penalty
++ 0.3 * cycle_volatility
+```
+
+**候选必须先过硬门槛，才进入软目标排序。**
+
+### A：Archive / Acceptance，保证 champion 单调不退化
+
+核心规则写成一句代码逻辑：
+
+```python
+if passes_hard_gates(candidate, incumbent) and statistically_better(candidate, incumbent):
+    champion = candidate
+else:
+    champion = incumbent
+```
+
+这就是你要的“总得越来越好”。更精确地说，是：
+
+```text
+candidate population 可以波动；
+archive 可以保存坏候选；
+但 deployable champion / cohort 必须单调不退化。
+```
+
+不要再允许：
+
+```text
+没有真实 sumo_report -> 也能进 evolved_cohort
+sumo_score = 0/空 -> 也能当 champion
+replay_score 高 -> 直接替换 seed
+```
+
+你已有材料里也提到，下一版 selector 不应该只按 replay score 排，而要强制 `sumo_score` 是真实评估、completed 不下降、waiting/queue 不恶化、安全裁剪不增加。
+
+## 4. 现在为什么会“进化反而差”：我会重点抓 4 个 bug
+
+第一，**SUMO 闭环没有成为硬门槛**。上面说了，`run_evolution.py` 没看到 `SUMOEvaluator` 接入，selector 虽然写了 champion 概念，但主进化流程里实际只创建了 replay evaluator。([GitHub][6])
+
+第二，**runner 还没有真正执行 phase skill**。OnlineController 路径的注释明确说“只在检测到进入新的绿色相位时才干预，且只使用 `setPhaseDuration()` 控制绿色相位持续时间”。([GitHub][4]) 后面实际也是从 cycle plan 取 duration，然后 `traci.trafficlight.setPhaseDuration()`，并没有真正让 phase skill 做 hold/switch/extend/shorten 的闭环决策。([GitHub][4])
+
+第三，**observation mismatch**。runner 构造 `PhaseObservation` 时 `predicted_arrival=0.0`。([GitHub][4]) 如果 evolved skill 使用 `predicted_arrival`，那它在真实运行里等于用了一个恒为 0 的假特征。你材料里也明确指出：这会让 GLM 以为自己利用了预测到达，但真实闭环里这个信号不存在，目标和执行环境错位。
+
+第四，**净化/进化可能删掉 seed 的保护机制**。手写 seed 里通常有 hunger、smoothing、spillback guard 这类“土但稳”的保护。GLM 如果只是把代码写漂亮，或者根据 replay score 改公式，很容易削弱这些保护。你材料里建议把净化改成 regression-preserving purification：不得删除 hunger / smoothing / spillback guard，不得在 golden observations 上大幅改变动作。
+
+## 5. 你要的“保证越来越好”，应该分两条线实现
+
+### 线 A：单路口 skill 进化
+
+每个路口 `i` 有当前 incumbent：
+
+```text
+CycleSkill_i_current
+PhaseSkill_i_current
+```
+
+每轮进化：
+
+```text
+1. GLM 生成结构变体。
+2. DSL/schema/AST 过滤。
+3. 行为契约测试。
+4. Replay safety。
+5. 参数优化器调权重。
+6. micro-SUMO_i 评估。
+7. 与 current 做 paired comparison。
+8. 赢了才替换 current。
+```
+
+行为契约测试必须包含：
+
+```text
+队列增加，相位优先级不能下降太多；
+某相位长时间未服务，hunger bonus 必须上升；
+下游严重堵塞，对应放行相位不能继续大幅加绿；
+所有必须相位都要服务；
+同一 observation 多次调用输出必须一致；
+cycle jump 不能超过阈值。
+```
+
+你材料里已经把这层写得很对：不要让净化只是 “LLM rewrite -> AST pass -> 保存”，而应该走 schema、AST、unit tests、behavioral contract、replay safety、micro-SUMO、full-SUMO sealed 才能成为 champion。
+
+### 线 B：cohort 级进化
+
+交通信号不是每个路口单独最优就行。一个路口本地变好，可能把车推到下游，让 corridor 变差。所以要有 cohort selector：
+
+```text
+每个路口保留 top K 个候选：
+  A: 5 个
+  B: 5 个
+  C: 5 个
+  ...
+
+中心做 beam search / tournament：
+  组合成 cohort candidates
+  在 corridor T-SUMO 里跑
+  选全局不退化的 cohort
+```
+
+这和之前“中心做仲裁，不做每秒控制”的设计一致：中心负责 message broker、corridor context、skill cohort selector，而不是在线替每个路口每秒控灯。
+
+cohort 接受规则也要写死：
+
+```text
+global_completed 不下降；
+global_avg_waiting 不上升；
+global_avg_queue 不上升；
+任一路口 starvation 不增加；
+任一路口 safety override 不增加；
+下游 spillback 不增加；
+通过 corridor sealed scenarios。
+```
+
+## 6. 我建议你马上改的代码规则
+
+第一，把 selector 改成两个 API：
+
+```python
+select_archive_best(candidates) -> ArchiveEntry | None
+select_deployable_champion(candidates, incumbent) -> ArchiveEntry | incumbent
+```
+
+不要再让一个 `select()` 同时负责 archive 和 champion。现在的 fallback 会把 archive best 误当 evolved best。
+
+第二，在 manifest 里加硬字段：
+
+```json
+{
+  "is_archive_candidate": true,
+  "is_deployable_champion": false,
+  "has_real_sumo_report": false,
+  "incumbent_skill_id": "...",
+  "paired_eval_passed": false,
+  "accepted_for_deployment": false,
+  "rejection_reason": "missing_real_sumo_report"
+}
+```
+
+第三，`evolved_cohort.json` 只能引用：
+
+```text
+accepted_for_deployment = true
+has_real_sumo_report = true
+paired_eval_passed = true
+```
+
+否则继续用 seed/incumbent。
+
+第四，把 `run_evolution.py` 改成真的创建并传入：
+
+```python
+sumo_evaluator = SUMOEvaluator(...)
+selector = SkillSelector(sumo_evaluator=sumo_evaluator)
+
+evolver = PerIntersectionEvolver(
+    ...
+    replay_evaluator=replay_evaluator,
+    sumo_evaluator=sumo_evaluator,
+    seed_cohort=cohort,
+    scenario_catalog=scenario_catalog,
+)
+```
+
+现在 `scenario_catalog_path` 虽然有参数和加载逻辑，但没有接入 `SUMOEvaluator`，这就会出现“看起来支持多场景，实际上没有用 SUMO 做 champion gate”的问题。([GitHub][6])
+
+第五，把当前 evolved cohort 先降级命名：
+
+```text
+archive_evolved_candidates_v001.json
+```
+
+不要叫：
+
+```text
+deployable_evolved
+champion
+best
+```
+
+因为当前 sealed SUMO 结果已经显示它比 Seed 差。
+
+## 7. MaxPressure 这边怎么做成“靠谱 baseline”
+
+我建议短期改三件事。
+
+第一，默认 baseline 不再用 alias：
+
+```python
+"MaxPressure": create_max_pressure("canonical", decision_interval=5.0)
+```
+
+不要再让 `MaxPressureSkill = MaxPressureCyclicAllocation` 偷偷作为默认强 baseline。`max_pressure.py` 现在已经有 factory，直接用 variant 名更清楚。([GitHub][3])
+
+第二，修 movement mapping。当前 runner 能从 SUMO traffic light connections 里构造 `phase_incoming` 和 `phase_outgoing`。([GitHub][4]) 但 MaxPressure 真正需要的是：
+
+```text
+phase_id -> movements
+movement -> upstream lanes
+movement -> downstream lanes
+movement -> saturation flow
+movement -> turning ratio
+```
+
+不是简单把所有 downstream queue 平均掉。否则 pressure 就会失真。
+
+第三，加入 switching loss aware 版本。很多 MaxPressure 论文/实践都会提醒：原始 MaxPressure 的非周期相位选择、频繁切换、忽略切换损失，会导致现实效果受损；cyclic MaxPressure 是为了工程可接受性，但可能比 original non-cyclic 弱。([科学直达][2]) 所以我们的 canonical baseline 不能粗暴每 5 秒乱切，要有：
+
+```text
+min_green
+max_green
+yellow/all-red loss
+cooldown
+pressure hysteresis
+switch penalty
+```
+
+最终 baseline 表应该这么报：
 
 ```text
 FixedTime
-MaxPressure-Current
-MaxPressure-QueueOnly
+MaxPressure-CyclicAllocation
 MaxPressure-Canonical
-MaxPressure-CyclicMovement
-SignalClaw
+MaxPressure-SwitchLossAware
+SOTL
+SignalClaw-Seed
+SignalClaw-Evolved-Champion
 ```
 
-这样才能定位 MaxPressure 差在哪里。
+如果 `MaxPressure-Canonical` 还不能大体压过 FixedTime，那就先别急着吹 SignalClaw，先查 phase mapping / pressure / metrics。MaxPressure 是我们的 sanity check。
 
-### C. 把 evolved champion 的门槛改掉
+## 8. 最终路线：不要追求每个 candidate 都变好，要保证 champion 越来越好
 
-现在 manifest 里 `sumo_score=0.0` 的 evolved skill 不应该被标成最终 champion。它可以进入 archive，但不能进入 deployable cohort。([GitHub][5])
-
-建议规则：
+可以把下一阶段目标改成：
 
 ```text
-archive candidate:
-  AST + replay 通过即可进入 archive。
-
-champion candidate:
-  必须有真实 sumo_report。
-  必须和 seed 在同一 sealed scenario 上比较。
-  必须通过不退化门槛。
+v1.3 META Optimization: Monotonic Champion Evolution
 ```
 
-### D. 把“净化”改成 regression-preserving purification
-
-净化不是让 GLM 把代码写得更漂亮，而是：
+验收标准：
 
 ```text
-保留 seed 的安全行为；
-只修语法、接口、可读性、边界处理；
-不得删除 hunger / smoothing / spillback guard；
-不得改变 golden observations 上的动作超过阈值。
+1. 每轮可以产生坏 candidate，但坏 candidate 只能进 archive。
+2. Deployable champion 必须有真实 SUMO sealed report。
+3. Champion 更新必须相对 incumbent 通过 paired non-degradation gate。
+4. 如果没有 candidate 通过，champion 保持不变。
+5. MaxPressure-Canonical 必须作为强 baseline 参与所有 sealed comparison。
+6. Evolved cohort 如果比 Seed 差，系统必须自动回退 Seed，而不是输出 Evolved。
 ```
 
-可以做一个 golden set：
+一句话：
 
-```text
-100 个低流量状态
-100 个高流量状态
-100 个下游堵塞状态
-100 个单相位饥饿状态
-100 个邻居释放压力状态
-```
+> **Meta Optimization 的核心不是“让 GLM 每次都写出更好算法”，而是“让系统只接受真的更好的算法”。**
 
-净化后 skill 在这些状态上必须满足：
-
-```text
-action 不违反约束
-duration 与 seed 差异不超过 X 秒，除非 evaluator 证明更好
-饥饿相位优先级不能下降
-下游堵塞相位绿灯不能增加
-```
-
-### E. 让 LLM 输出 DSL，不直接输出 Python
-
-比如周期 DSL：
-
-```yaml
-skill_type: cycle
-score:
-  queue: 1.0
-  waiting_time: 0.25
-  predicted_arrival: 0.8
-  hunger: 0.6
-  downstream_spillback: -1.2
-cycle:
-  base: 80
-  queue_gain: 0.5
-  min: 40
-  max: 180
-allocation:
-  method: softmax_or_shifted_positive
-  min_green: 10
-  max_green: 60
-guards:
-  all_phases_served: true
-  max_cycle_jump: 20
-  downstream_block_clip: true
-```
-
-编译器自己生成 Python。这样 AST 通过率、可解释性、可调参性都会更好。
-
----
-
-## 7. 最核心的判断
-
-我会把现在的问题定性成：
-
-```text
-MaxPressure 问题：
-  当前实现不是严格 MaxPressure；
-  指标口径也还不够干净；
-  因此它比 FixedTime 某些指标差，不一定是理论问题，更可能是 baseline 实现和评估口径问题。
-
-Evolved / Purified Skill 问题：
-  当前进化选择压力主要来自 AST / replay；
-  SUMO 闭环评分没有真正成为硬门槛；
-  evolved skill 使用的部分输入在 runner 里恒为 0；
-  手写 seed 的隐含保护机制被进化/净化削弱；
-  因此 evolved 在部分指标上比 seed 差，是预期内的。
-
-Meta Optimization 方向：
-  应该采用 FunSearch / AlphaEvolve 风格：
-  LLM 生成候选，自动 evaluator 做裁判，archive 保留历史，Pareto selector 选 champion。
-  不应该让 LLM 单独决定哪个 skill 好。
-
-结构化输出方向：
-  必须做。
-  最好从“直接 Python”升级成“JSON schema + DSL + compiler + AST + behavior tests”。
-
-是否完全依靠大模型：
-  不应该。
-  LLM 用来产生结构和修复思路；
-  参数优化、约束验证、SUMO 闭环评估、上线安全层必须是确定性的。
-```
-
-下一步最值得先做的是：**修指标 + 重写 canonical MaxPressure + 把 evolved champion 的门槛改成必须有真实 SUMO sealed evaluation**。这三件事做完，MaxPressure 和净化/进化到底有没有真实问题，基本就能分清了。
+这才是交通控制里可靠的进化。
 
 [1]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/results/summary.json "raw.githubusercontent.com"
-[2]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/signalclaw/skills/max_pressure.py "raw.githubusercontent.com"
-[3]: https://rosap.ntl.bts.gov/view/dot/66432/dot_66432_DS1.pdf?utm_source=chatgpt.com "Learning the max pressure control for urban traffic networks"
-[4]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/signalclaw/experiments/runner.py "raw.githubusercontent.com"
-[5]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/artifacts/evolution_archive/evolved_skills/1159176756/cycle/v0001/manifest.json "raw.githubusercontent.com"
-[6]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/artifacts/evolution_archive/evolution_summary.json "raw.githubusercontent.com"
-[7]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/artifacts/evolution_archive/evolved_skills/1159176756/cycle/v0001/skill.py "raw.githubusercontent.com"
-[8]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/artifacts/skills/314622964/cycle/v0000/skill.py "raw.githubusercontent.com"
-[9]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/artifacts/evolution_archive/evolved_cohort.json "raw.githubusercontent.com"
-[10]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/signalclaw/evolution/ast_sandbox.py "raw.githubusercontent.com"
-[11]: https://deepmind.google/blog/funsearch-making-new-discoveries-in-mathematical-sciences-using-large-language-models/?utm_source=chatgpt.com "FunSearch: Making new discoveries in mathematical ..."
-[12]: https://arxiv.org/abs/2309.03409?utm_source=chatgpt.com "Large Language Models as Optimizers"
-[13]: https://arxiv.org/abs/2406.07496?utm_source=chatgpt.com "TextGrad: Automatic \"Differentiation\" via Text"
-[14]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/signalclaw/evolution/selector.py "raw.githubusercontent.com"
+[2]: https://www.sciencedirect.com/science/article/abs/pii/S0968090X20307324?utm_source=chatgpt.com "Max-pressure signal control with cyclical phase structure"
+[3]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/signalclaw/skills/max_pressure.py "raw.githubusercontent.com"
+[4]: https://github.com/Radar-Lei/SignalClawLigh/blob/main/signalclaw/experiments/runner.py "SignalClawLigh/signalclaw/experiments/runner.py at main · Radar-Lei/SignalClawLigh · GitHub"
+[5]: https://raw.githubusercontent.com/Radar-Lei/SignalClawLigh/main/signalclaw/evolution/selector.py "raw.githubusercontent.com"
+[6]: https://github.com/Radar-Lei/SignalClawLigh/blob/main/signalclaw/evolution/run_evolution.py "SignalClawLigh/signalclaw/evolution/run_evolution.py at main · Radar-Lei/SignalClawLigh · GitHub"
+[7]: https://deepmind.google/blog/funsearch-making-new-discoveries-in-mathematical-sciences-using-large-language-models/?utm_source=chatgpt.com "FunSearch: Making new discoveries in mathematical ..."
