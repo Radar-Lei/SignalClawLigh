@@ -478,6 +478,11 @@ class SUMOEvaluator:
                 sim_step_length=self.step_length,
             )
 
+            # 创建 PhaseCommandExecutor（跨 step 保持 pending 状态）
+            phase_executor = PhaseCommandExecutor.for_adapter(
+                adapter, self.constraints
+            )
+
             # 运行仿真主循环
             max_steps = int(self.eval_duration / self.step_length)
             sim_time = 0.0
@@ -489,11 +494,14 @@ class SUMOEvaluator:
                 # 观测所有路口
                 all_obs = adapter.observe_network()
 
+                # 处理 pending switch durations（过渡完成后设置 duration）
+                phase_executor.process_pending_switches(tls_ids)
+
                 # 对每个路口执行 controller step
                 for tls_id in tls_ids:
                     cmd = controller.step(tls_id, sim_time, all_obs)
                     if cmd is not None:
-                        self._apply_command(adapter, tls_id, cmd)
+                        phase_executor.apply(cmd, tls_id)
 
                 # 跳过热身阶段
                 if step_num < self.warmup_steps:
@@ -571,34 +579,6 @@ class SUMOEvaluator:
 
         finally:
             adapter.close()
-
-    # ======================================================================
-    # Command application
-    # ======================================================================
-
-    def _apply_command(
-        self,
-        adapter: SumoTraCIAdapter,
-        tls_id: str,
-        cmd: PhaseCommand,
-    ) -> None:
-        """将 PhaseCommand 应用到 SUMO 仿真中。"""
-        if cmd.action == "switch":
-            # 切换到新相位
-            # 先切到黄灯（找到当前相位到目标相位之间的黄灯相位）
-            adapter.set_phase(tls_id, cmd.next_phase_id, cmd.duration)
-
-        elif cmd.action == "extend":
-            # 延长当前相位
-            adapter.extend_current_phase(tls_id, cmd.duration)
-
-        elif cmd.action == "shorten":
-            # 缩短当前相位
-            adapter.extend_current_phase(tls_id, cmd.duration)
-
-        elif cmd.action == "hold":
-            # 保持当前相位
-            pass  # SUMO 自动继续
 
     # ======================================================================
     # Metrics computation

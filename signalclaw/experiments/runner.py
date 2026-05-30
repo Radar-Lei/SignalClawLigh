@@ -32,6 +32,7 @@ from signalclaw.skills.signalclaw_skill import SignalClawSkill
 from signalclaw.skills.cohort import SkillCohort
 from signalclaw.network.neighbor_graph import NeighborGraph
 from signalclaw.execution.online_controller import OnlineController
+from signalclaw.execution.phase_command_executor import PhaseCommandExecutor
 
 
 # ======================================================================
@@ -196,9 +197,6 @@ class ExperimentRunner:
         # TODO: 接入真实预测模块后默认改为 True。
         self.enable_prediction = enable_prediction
         self.results: Dict[str, SimulationMetrics] = {}
-        # switch 命令的 pending duration: tls_id -> (target_green_phase, duration)
-        # 当 SUMO 自然过渡到目标绿色相位时，设置期望的 duration
-        self._pending_switch_durations: Dict[str, Tuple[int, float]] = {}
 
     # ------------------------------------------------------------------
     # 通用仿真主循环（用于所有方法）
@@ -313,9 +311,6 @@ class ExperimentRunner:
         if controller is not None and hasattr(controller, 'reset'):
             controller.reset()
 
-        # 清空 pending switch durations
-        self._pending_switch_durations.clear()
-
         # 每个 TLS 的追踪状态（用于非 OnlineController 方法）
         tls_state: Dict[str, dict] = {}
         for tid in tls_ids:
@@ -327,6 +322,13 @@ class ExperimentRunner:
 
         # OnlineController 的特殊状态
         is_online = isinstance(controller, OnlineController)
+
+        # 为 OnlineController 创建 PhaseCommandExecutor（跨 step 保持 pending 状态）
+        phase_executor = None
+        if is_online:
+            phase_executor = PhaseCommandExecutor.for_traci(
+                traci, tls_data, controller.safety_layer.constraints
+            )
 
         step = 0
         sim_time = 0.0
@@ -352,7 +354,7 @@ class ExperimentRunner:
             elif is_online:
                 # OnlineController 路径（SignalClaw-Seed / SignalClaw-Evolved）
                 self._control_with_online_controller(
-                    traci, tls_ids, tls_data, sim_time, controller
+                    traci, tls_ids, tls_data, sim_time, controller, phase_executor
                 )
 
             else:
@@ -489,7 +491,8 @@ class ExperimentRunner:
 
     def _control_with_online_controller(self, traci, tls_ids: list,
                                          tls_data: dict, sim_time: float,
-                                         controller: OnlineController) -> None:
+                                         controller: OnlineController,
+                                         executor: PhaseCommandExecutor) -> None:
         """使用 OnlineController 控制所有路口 — 完整双 Skill 闭环。
 
         每个 sim step 对每个 tls_id 调用 online_controller.step()，
@@ -512,21 +515,10 @@ class ExperimentRunner:
                 traci, tls_id, tls_data, current_phase
             )
 
-        # 第一步半：处理 pending switch durations
-        # 当 SUMO 自然过渡到目标绿色相位时，设置之前记录的 duration
-        for tls_id in tls_ids:
-            pending = self._pending_switch_durations.get(tls_id)
-            if pending is not None:
-                target_phase, target_duration = pending
-                current_phase = traci.trafficlight.getPhase(tls_id)
-                if current_phase == target_phase:
-                    # 已经到了目标绿色相位
-                    state_str = tls_data[tls_id]['phases'][current_phase].state
-                    if is_green_phase(state_str):
-                        traci.trafficlight.setPhaseDuration(tls_id, target_duration)
-                        del self._pending_switch_durations[tls_id]
+        # 第二步：处理 pending switch durations
+        executor.process_pending_switches(tls_ids)
 
-        # 第二步：对每个路口调用 online_controller.step()
+        # 第三步：对每个路口调用 online_controller.step()
         for tls_id in tls_ids:
             cmd = controller.step(tls_id, sim_time, all_obs)
 
@@ -534,101 +526,7 @@ class ExperimentRunner:
                 continue
 
             # 将 PhaseCommand 映射为 TraCI 操作
-            self._apply_phase_command_to_traci(
-                traci, tls_id, tls_data, cmd, controller
-            )
-
-    # ------------------------------------------------------------------
-    # PhaseCommand -> TraCI 映射
-    # ------------------------------------------------------------------
-
-    def _apply_phase_command_to_traci(
-        self, traci, tls_id: str, tls_data: dict,
-        cmd: PhaseCommand, controller: OnlineController
-    ) -> None:
-        """将 PhaseCommand 映射为具体的 TraCI 调用。
-
-        PhaseCommand.action:
-        - hold:    保持当前相位，不做 TraCI 调用（让 SUMO 继续倒计时）
-        - extend:  延长当前绿色相位，使用 setPhaseDuration
-        - shorten: 缩短当前绿色相位，使用 setPhaseDuration
-        - switch:  切到 next_phase_id，处理 yellow/all-red 过渡
-        """
-        td = tls_data[tls_id]
-        current_phase = traci.trafficlight.getPhase(tls_id)
-        state_str = td['phases'][current_phase].state
-        current_is_green = is_green_phase(state_str)
-
-        constraints = controller.safety_layer.constraints.get(tls_id)
-
-        if cmd.action == "hold":
-            # hold: 保持当前相位，不干预 SUMO 倒计时
-            # 无需 TraCI 调用
-            pass
-
-        elif cmd.action == "extend":
-            # extend: 延长当前绿色相位持续时间
-            # 只在当前是绿色相位时才有效
-            if current_is_green:
-                # setPhaseDuration 设置的是"从现在起的剩余时间"
-                # cmd.duration 是延长后的总持续时间
-                remaining = traci.trafficlight.getNextSwitch(tls_id) - traci.simulation.getTime()
-                # extra = 新总时间 - 已过时间，即新的剩余时间
-                elapsed = max(0.0, td['default_durations'][current_phase] - remaining
-                              if current_phase < len(td['default_durations']) else 0.0)
-                new_remaining = cmd.duration - elapsed
-                if new_remaining > remaining and new_remaining > 0:
-                    traci.trafficlight.setPhaseDuration(tls_id, new_remaining)
-
-        elif cmd.action == "shorten":
-            # shorten: 缩短当前绿色相位持续时间
-            # 只在当前是绿色相位时才有效
-            if current_is_green:
-                remaining = traci.trafficlight.getNextSwitch(tls_id) - traci.simulation.getTime()
-                elapsed = max(0.0, td['default_durations'][current_phase] - remaining
-                              if current_phase < len(td['default_durations']) else 0.0)
-                # 缩短后不能低于 min_green
-                min_remaining = max(0.0, constraints.min_green - elapsed)
-                new_remaining = max(min_remaining, cmd.duration)
-                if new_remaining < remaining:
-                    traci.trafficlight.setPhaseDuration(tls_id, new_remaining)
-
-        elif cmd.action == "switch":
-            # switch: 切到 next_phase_id
-            # SUMO TLS 程序定义了完整的相位序列（green -> yellow -> all_red -> green）
-            # 不能跳过中间的 yellow/all-red 过渡。
-            #
-            # 策略：
-            # 1. 如果当前是绿色相位且目标是另一个绿色相位 -> 结束当前绿色相位
-            #    （setPhaseDuration=1 让 SUMO 自然过渡 yellow/all-red 到目标）
-            # 2. 如果当前已经是目标绿色相位 -> 设置新的 duration
-            # 3. 如果当前在非绿色相位（yellow/all-red）-> 不干预，让过渡完成
-            target_green = cmd.next_phase_id
-
-            # 确认目标相位在 TLS 程序中存在
-            if target_green < 0 or target_green >= td['num_phases']:
-                return
-
-            if current_is_green:
-                if current_phase == target_green:
-                    # 已经在目标绿色相位，设置新的 duration
-                    traci.trafficlight.setPhaseDuration(tls_id, cmd.duration)
-                else:
-                    # 需要切到另一个绿色相位
-                    # 结束当前绿色相位，让 SUMO 自然过渡 yellow -> all_red -> target green
-                    # 设置最小剩余时间（1 步），让 SUMO 尽快进入过渡
-                    remaining = traci.trafficlight.getNextSwitch(tls_id) - traci.simulation.getTime()
-                    if remaining > 1.0:
-                        traci.trafficlight.setPhaseDuration(tls_id, 1.0)
-                    # 当 SUMO 自然过渡到目标绿色相位时，再通过下一次 step 设置 duration
-                    # 记录目标绿色相位和期望的 duration，等过渡完成后设置
-                    self._pending_switch_durations[tls_id] = (target_green, cmd.duration)
-            else:
-                # 当前在非绿色相位（yellow/all-red 过渡中）
-                # 不干预过渡过程，让 SUMO 自然完成过渡
-                # pending switch duration 将在 _control_with_online_controller
-                # 的下一步中被检测和处理
-                pass
+            executor.apply(cmd, tls_id)
 
     # ------------------------------------------------------------------
     # 传统 skill 控制（MaxPressure / SignalClaw）
